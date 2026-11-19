@@ -1,0 +1,891 @@
+"use client";
+
+import { useState, useEffect, useCallback } from "react";
+import { QRCodeSVG } from "qrcode.react";
+import {
+  Search,
+  Plus,
+  Pencil,
+  BookCopy,
+  ChevronLeft,
+  ChevronRight,
+  Filter,
+  Download,
+  Trash2,
+  Printer,
+  X,
+} from "lucide-react";
+import { getBooks, createBook, updateBook, deleteBook } from "@/lib/supabase/books";
+import { getClassifications } from "@/lib/supabase/classifications";
+import { getEffectiveSession } from "@/lib/client-session";
+import { getServerDateString, getServerNow } from "@/lib/server-clock";
+import { requestPrint } from "@/lib/print";
+import { canEdit, canDelete, STAFF_RESTRICTED_MESSAGE } from "@/lib/permissions";
+import Modal, { ConfirmModal } from "@/components/ui/modal";
+import type { BookWithClassification, Classification, BookStatus, MaterialType, StaffRole } from "@/lib/types";
+
+const statusStyles: Record<string, string> = {
+  Available: "bg-emerald-50 text-emerald-700 border border-emerald-200",
+  Borrowed: "bg-blue-50 text-blue-700 border border-blue-200",
+  Lost: "bg-red-50 text-red-700 border border-red-200",
+  Damaged: "bg-amber-50 text-amber-700 border border-amber-200",
+};
+
+interface BookForm {
+  title: string;
+  author: string;
+  accession_number: string;
+  classification_id: string;
+  shelf_location: string;
+  material_type: MaterialType;
+  status: BookStatus;
+  is_library_use_only: boolean;
+  notes: string;
+}
+
+const emptyForm: BookForm = {
+  title: "",
+  author: "",
+  accession_number: "",
+  classification_id: "",
+  shelf_location: "",
+  material_type: "Book",
+  status: "Available",
+  is_library_use_only: false,
+  notes: "",
+};
+
+interface BookFormModalProps {
+  open: boolean;
+  title: string;
+  subtitle?: string;
+  form: BookForm;
+  setForm: (f: BookForm) => void;
+  formError: string | null;
+  classifications: Classification[];
+  submitting: boolean;
+  isEdit: boolean;
+  onSubmit: (e: React.FormEvent) => Promise<void>;
+  onClose: () => void;
+}
+
+function BookFormModal({
+  open,
+  title,
+  subtitle,
+  form,
+  setForm,
+  formError,
+  classifications,
+  submitting,
+  isEdit,
+  onSubmit,
+  onClose,
+}: BookFormModalProps) {
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={title}
+      subtitle={subtitle}
+      footer={
+        <>
+          <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors">Cancel</button>
+          <button type="submit" form="book-form" disabled={submitting} className="px-4 py-2 rounded-lg bg-emerald-700 text-white text-sm font-medium hover:bg-emerald-800 transition-colors disabled:opacity-50">
+            {submitting ? "Saving..." : isEdit ? "Save Changes" : "Add Book"}
+          </button>
+        </>
+      }
+    >
+      <form id="book-form" onSubmit={onSubmit} className="space-y-4">
+        {formError && (
+          <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">{formError}</div>
+        )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="sm:col-span-2">
+              <label className="block text-sm font-medium text-slate-700 mb-1">Title *</label>
+              <input type="text" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="block text-sm font-medium text-slate-700 mb-1">Author *</label>
+              <input type="text" value={form.author} onChange={(e) => setForm({ ...form, author: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Accession Number *</label>
+              <input type="text" value={form.accession_number} onChange={(e) => setForm({ ...form, accession_number: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Category *</label>
+              <select value={form.classification_id} onChange={(e) => setForm({ ...form, classification_id: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500">
+                <option value="">Select category</option>
+                {classifications.map((c) => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Shelf Location</label>
+              <input type="text" value={form.shelf_location} onChange={(e) => setForm({ ...form, shelf_location: e.target.value })} placeholder="e.g. CS-A1-04" className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Material Type</label>
+              <select value={form.material_type} onChange={(e) => setForm({ ...form, material_type: e.target.value as MaterialType })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500">
+                <option value="Book">Book</option>
+                <option value="Non-Book">Non-Book</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Status</label>
+              <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value as BookStatus })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500">
+                <option value="Available">Available</option>
+                <option value="Borrowed">Borrowed</option>
+                <option value="Lost">Lost</option>
+                <option value="Damaged">Damaged</option>
+              </select>
+            </div>
+            <div className="sm:col-span-2">
+              <label className="block text-sm font-medium text-slate-700 mb-1">Notes</label>
+              <textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} rows={2} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={form.is_library_use_only} onChange={(e) => setForm({ ...form, is_library_use_only: e.target.checked })} className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
+                <span className="text-sm font-medium text-slate-700">Library Use Only</span>
+              </label>
+            </div>
+          </div>
+      </form>
+    </Modal>
+  );
+}
+
+export default function BooksPage() {
+  const [books, setBooks] = useState<BookWithClassification[]>([]);
+  const [classifications, setClassifications] = useState<Classification[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const [search, setSearch] = useState("");
+  const [category, setCategory] = useState("all");
+  const [status, setStatus] = useState("all");
+  const [page, setPage] = useState(1);
+  const perPage = 10;
+
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [editingBook, setEditingBook] = useState<BookWithClassification | null>(null);
+  const [form, setForm] = useState<BookForm>(emptyForm);
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const [printingBook, setPrintingBook] = useState<BookWithClassification | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showBulkPrint, setShowBulkPrint] = useState(false);
+
+  const [deletingBook, setDeletingBook] = useState<BookWithClassification | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  const [role, setRole] = useState<StaffRole | null>(null);
+  // Optimistic until the session loads: only an explicit Staff role is restricted.
+  const staffRestricted = role === "Staff";
+  const allowEdit = role ? canEdit(role) : true;
+  const allowDelete = role ? canDelete(role) : true;
+
+  const fetchData = useCallback(async () => {
+    try {
+      setLoading(true);
+      const [booksData, classData, session] = await Promise.all([
+        getBooks(),
+        getClassifications(),
+        getEffectiveSession(),
+      ]);
+      setBooks(booksData);
+      setClassifications(classData);
+      if (session) setRole(session.role);
+      setError(null);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to load books");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- standard data-fetch pattern
+  useEffect(() => { fetchData(); }, [fetchData]);
+
+  const filtered = books.filter((b) => {
+    const catName = b.classifications?.name ?? "";
+    const matchSearch =
+      !search ||
+      b.title.toLowerCase().includes(search.toLowerCase()) ||
+      b.author.toLowerCase().includes(search.toLowerCase()) ||
+      catName.toLowerCase().includes(search.toLowerCase()) ||
+      b.accession_number.toLowerCase().includes(search.toLowerCase());
+    const matchCat = category === "all" || catName === category;
+    const matchStatus = status === "all" || b.status === status;
+    return matchSearch && matchCat && matchStatus;
+  });
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
+  const start = (page - 1) * perPage + 1;
+  const end = Math.min(page * perPage, filtered.length);
+  const pageBooks = filtered.slice((page - 1) * perPage, page * perPage);
+
+  // Selection survives paging/filtering; derive from `books` so deleted ids drop out
+  const selectedBooks = books.filter((b) => selectedIds.has(b.id));
+  const pageSelectedCount = pageBooks.filter((b) => selectedIds.has(b.id)).length;
+  const allPageSelected = pageBooks.length > 0 && pageSelectedCount === pageBooks.length;
+  const allFilteredSelected = filtered.length > 0 && filtered.every((b) => selectedIds.has(b.id));
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const togglePageSelection = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      pageBooks.forEach((b) => (allPageSelected ? next.delete(b.id) : next.add(b.id)));
+      return next;
+    });
+  };
+
+  const selectAllFiltered = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      filtered.forEach((b) => next.add(b.id));
+      return next;
+    });
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+
+  // Books rendered on the print-only label sheet
+  const labelBooks = printingBook ? [printingBook] : showBulkPrint ? selectedBooks : [];
+
+  const openAddModal = () => {
+    setForm(emptyForm);
+    setFormError(null);
+    setShowAddModal(true);
+  };
+
+  const openEditModal = (book: BookWithClassification) => {
+    if (!allowEdit) {
+      setError(STAFF_RESTRICTED_MESSAGE);
+      return;
+    }
+    setForm({
+      title: book.title,
+      author: book.author,
+      accession_number: book.accession_number,
+      classification_id: book.classification_id,
+      shelf_location: book.shelf_location ?? "",
+      material_type: book.material_type,
+      status: book.status,
+      is_library_use_only: book.is_library_use_only,
+      notes: book.notes ?? "",
+    });
+    setEditingBook(book);
+    setFormError(null);
+    setShowEditModal(true);
+  };
+
+  const handleAddSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!form.title || !form.author || !form.accession_number || !form.classification_id) {
+      setFormError("Title, author, accession number, and category are required.");
+      return;
+    }
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      const newBook = await createBook({
+        title: form.title,
+        author: form.author,
+        accession_number: form.accession_number,
+        classification_id: form.classification_id,
+        shelf_location: form.shelf_location || null,
+        material_type: form.material_type,
+        status: form.status,
+        is_library_use_only: form.is_library_use_only,
+        notes: form.notes || null,
+      });
+      setShowAddModal(false);
+      await fetchData();
+      setPrintingBook(newBook as BookWithClassification);
+    } catch (err: unknown) {
+      setFormError(err instanceof Error ? err.message : "Failed to add book");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleEditSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingBook) return;
+    if (!form.title || !form.author || !form.accession_number || !form.classification_id) {
+      setFormError("Title, author, accession number, and category are required.");
+      return;
+    }
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      await updateBook(editingBook.id, {
+        title: form.title,
+        author: form.author,
+        accession_number: form.accession_number,
+        classification_id: form.classification_id,
+        shelf_location: form.shelf_location || null,
+        material_type: form.material_type,
+        status: form.status,
+        is_library_use_only: form.is_library_use_only,
+        notes: form.notes || null,
+      });
+      setShowEditModal(false);
+      setEditingBook(null);
+      await fetchData();
+    } catch (err: unknown) {
+      setFormError(err instanceof Error ? err.message : "Failed to update book");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!deletingBook) return;
+    if (!allowDelete) {
+      setDeleteError(STAFF_RESTRICTED_MESSAGE);
+      return;
+    }
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteBook(deletingBook.id);
+      setDeletingBook(null);
+      await fetchData();
+    } catch (err: unknown) {
+      setDeleteError(err instanceof Error ? err.message : "Failed to delete book");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const getQrUrl = (bookId: string) => {
+    if (typeof window !== "undefined") {
+      return `${window.location.origin}/borrow?bookId=${bookId}`;
+    }
+    return `/borrow?bookId=${bookId}`;
+  };
+
+  const handlePrintQr = (book: BookWithClassification) => {
+    setPrintingBook(book);
+  };
+
+  const printLabel = () => {
+    const title = printingBook
+      ? `QR Label — ${printingBook.title}`
+      : `QR Labels (${selectedBooks.length})`;
+    requestPrint({
+      title,
+      filename: `bcas_qr_labels_${getServerDateString()}.html`,
+      labelMode: true,
+    });
+  };
+
+  const handleExportCSV = () => {
+    const header = "Title,Author,Accession Number,Category,Shelf Location,Material Type,Status,Library Use Only\n";
+    const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const body = filtered
+      .map((b) =>
+        [
+          esc(b.title),
+          esc(b.author),
+          esc(b.accession_number),
+          esc(b.classifications?.name ?? ""),
+          esc(b.shelf_location ?? ""),
+          esc(b.material_type),
+          esc(b.status),
+          b.is_library_use_only ? "Yes" : "No",
+        ].join(",")
+      )
+      .join("\n");
+    const blob = new Blob(["\uFEFF" + header + body], { type: "text/csv;charset=utf-8;" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `books_${getServerDateString()}.csv`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  };
+
+  const handlePrintList = () => {
+    requestPrint({
+      title: "Books Inventory",
+      filename: `bcas_books_inventory_${getServerDateString()}.html`,
+    });
+  };
+
+  return (
+    <>
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4 animate-fade-in-up stagger-1 no-print">
+        <div>
+          <h2 className="text-xl sm:text-2xl font-bold text-slate-900">
+            Books
+          </h2>
+        </div>
+        <div className="flex items-center gap-3">
+          <button onClick={handleExportCSV} className="flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 bg-white hover:bg-slate-50 transition-colors no-print">
+            <Download className="w-4 h-4" />
+            <span className="hidden sm:inline">Export</span>
+          </button>
+          <button onClick={handlePrintList} className="hidden sm:flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 bg-white hover:bg-slate-50 transition-colors no-print">
+            <Printer className="w-4 h-4" />
+            <span>Print</span>
+          </button>
+          <button onClick={openAddModal} className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-700 text-white text-sm font-medium hover:bg-emerald-800 transition-colors">
+            <Plus className="w-4 h-4" />
+            <span className="hidden sm:inline">Add New Book</span>
+            <span className="sm:hidden">Add Book</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Search & Filters */}
+      <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-5 animate-fade-in-up stagger-2" data-print-area>
+        <div className="hidden print:block mb-4 print-header">
+          <h2 className="text-xl font-bold text-slate-900">BCAS Library — Books Inventory</h2>
+          <p className="text-sm text-slate-500">
+            Generated {getServerNow().toLocaleString()} • {filtered.length} record(s)
+            {search || category !== "all" || status !== "all" ? " (filtered)" : ""}
+          </p>
+        </div>
+        {staffRestricted && (
+          <div className="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-200 text-sm text-amber-800 no-print">
+            {STAFF_RESTRICTED_MESSAGE} Deleted books can be reviewed under Archive by a Librarian or Admin.
+          </div>
+        )}
+        <div className="flex flex-col sm:flex-row gap-3 mb-6 no-print">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+            <input
+              type="text"
+              placeholder="Search by title, author, or category..."
+              value={search}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                setPage(1);
+              }}
+              className="w-full pl-10 pr-4 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+            />
+          </div>
+          <div className="flex gap-3">
+            <div className="relative flex-1 sm:flex-none">
+              <select
+                value={category}
+                onChange={(e) => {
+                  setCategory(e.target.value);
+                  setPage(1);
+                }}
+                className="w-full sm:w-auto appearance-none pl-3 pr-8 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+              >
+                <option value="all">Category</option>
+                {classifications.map((c) => (
+                  <option key={c.id} value={c.name}>{c.name}</option>
+                ))}
+              </select>
+              <Filter className="absolute right-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+            </div>
+            <div className="relative flex-1 sm:flex-none">
+              <select
+                value={status}
+                onChange={(e) => {
+                  setStatus(e.target.value);
+                  setPage(1);
+                }}
+                className="w-full sm:w-auto appearance-none pl-3 pr-8 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+              >
+                <option value="all">Status</option>
+                <option value="Available">Available</option>
+                <option value="Borrowed">Borrowed</option>
+                <option value="Lost">Lost</option>
+                <option value="Damaged">Damaged</option>
+              </select>
+              <Filter className="absolute right-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+            </div>
+          </div>
+        </div>
+
+        {error && (
+          <div className="mb-4 p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">{error}</div>
+        )}
+
+        {/* Table */}
+        <div className="overflow-x-auto -mx-4 sm:mx-0 print:hidden">
+          <div className="inline-block min-w-full align-middle px-4 sm:px-0">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-slate-200">
+                  <th className="w-10 pl-4 pr-0 py-3">
+                    <input
+                      type="checkbox"
+                      aria-label="Select all books on this page"
+                      checked={allPageSelected}
+                      ref={(el) => {
+                        if (el) el.indeterminate = pageSelectedCount > 0 && !allPageSelected;
+                      }}
+                      onChange={togglePageSelection}
+                      disabled={loading || pageBooks.length === 0}
+                      className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
+                    />
+                  </th>
+                  <th className="text-left px-4 py-3 font-semibold text-slate-500 hidden sm:table-cell">
+                    Preview
+                  </th>
+                  <th className="text-left px-4 py-3 font-semibold text-slate-500">
+                    Title &amp; Author
+                  </th>
+                  <th className="text-left px-4 py-3 font-semibold text-slate-500 hidden md:table-cell">
+                    Category
+                  </th>
+                  <th className="text-left px-4 py-3 font-semibold text-slate-500 hidden lg:table-cell">
+                    Shelf Location
+                  </th>
+                  <th className="text-left px-4 py-3 font-semibold text-slate-500">
+                    Status
+                  </th>
+                  <th className="text-left px-4 py-3 font-semibold text-slate-500">
+                    Actions
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-12 text-center text-slate-400">
+                      Loading books...
+                    </td>
+                  </tr>
+                ) : filtered.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-12 text-center text-slate-400">
+                      No books found.
+                    </td>
+                  </tr>
+                ) : (
+                  pageBooks.map((book) => (
+                    <tr
+                      key={book.id}
+                      className={`border-b border-slate-50 last:border-0 transition-colors ${
+                        selectedIds.has(book.id) ? "bg-emerald-50/50" : "hover:bg-slate-50/50"
+                      }`}
+                    >
+                      <td className="w-10 pl-4 pr-0 py-4">
+                        <input
+                          type="checkbox"
+                          aria-label={`Select ${book.title}`}
+                          checked={selectedIds.has(book.id)}
+                          onChange={() => toggleSelect(book.id)}
+                          className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
+                        />
+                      </td>
+                      <td className="px-4 py-4 hidden sm:table-cell">
+                        <div className="w-10 h-14 rounded bg-slate-100 border border-slate-200 flex items-center justify-center">
+                          <BookCopy className="w-5 h-5 text-slate-300" />
+                        </div>
+                      </td>
+                      <td className="px-4 py-4">
+                        <p className="font-medium text-slate-900">{book.title}</p>
+                        <p className="text-xs text-slate-500 mt-0.5">{book.author}</p>
+                        <p className="text-xs text-slate-400 mt-0.5 md:hidden">
+                          {book.classifications?.name}
+                        </p>
+                      </td>
+                      <td className="px-4 py-4 text-slate-600 hidden md:table-cell">
+                        {book.classifications?.name}
+                      </td>
+                      <td className="px-4 py-4 font-mono text-xs text-slate-600 hidden lg:table-cell">
+                        {book.shelf_location ?? "—"}
+                      </td>
+                      <td className="px-4 py-4">
+                        <span className={`inline-block px-2.5 py-1 rounded text-xs font-semibold ${statusStyles[book.status] ?? "bg-slate-100 text-slate-600"}`}>
+                          {book.status}
+                        </span>
+                      </td>
+                      <td className="px-4 py-4">
+                        <div className="flex items-center gap-2 no-print">
+                          <button onClick={() => handlePrintQr(book)} className="text-slate-400 hover:text-emerald-600 transition-colors" title="Print QR Code">
+                            <Printer className="w-4 h-4" />
+                          </button>
+                          {allowEdit && (
+                            <button onClick={() => openEditModal(book)} className="text-slate-400 hover:text-slate-600 transition-colors" title="Edit">
+                              <Pencil className="w-4 h-4" />
+                            </button>
+                          )}
+                          {allowDelete && (
+                            <button onClick={() => setDeletingBook(book)} className="text-slate-400 hover:text-red-600 transition-colors" title="Delete">
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Print-only full list (screen table is paginated) */}
+        <div className="hidden print:block">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-slate-200">
+                <th className="text-left px-2 py-2 font-semibold text-slate-500">Title &amp; Author</th>
+                <th className="text-left px-2 py-2 font-semibold text-slate-500">Accession #</th>
+                <th className="text-left px-2 py-2 font-semibold text-slate-500">Category</th>
+                <th className="text-left px-2 py-2 font-semibold text-slate-500">Shelf</th>
+                <th className="text-left px-2 py-2 font-semibold text-slate-500">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((book) => (
+                <tr key={book.id} className="border-b border-slate-100">
+                  <td className="px-2 py-2">
+                    <div className="font-medium text-slate-800">{book.title}</div>
+                    <div className="text-xs text-slate-500">{book.author}</div>
+                  </td>
+                  <td className="px-2 py-2 font-mono text-xs text-slate-600">{book.accession_number}</td>
+                  <td className="px-2 py-2 text-slate-600">{book.classifications?.name}</td>
+                  <td className="px-2 py-2 font-mono text-xs text-slate-600">{book.shelf_location ?? "—"}</td>
+                  <td className="px-2 py-2 text-slate-600">{book.status}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {filtered.length === 0 && (
+            <p className="py-8 text-center text-slate-400 text-sm">No books found.</p>
+          )}
+        </div>
+
+        {/* Pagination */}
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-3 mt-4 pt-4 border-t border-slate-100 no-print">
+          <p className="text-sm text-slate-500">
+            Showing {filtered.length > 0 ? start : 0} to {end} of{" "}
+            {filtered.length} entries
+          </p>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page === 1}
+              className="w-8 h-8 flex items-center justify-center rounded border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            {Array.from({ length: totalPages }, (_, i) => i + 1).map((p) => (
+              <button
+                key={p}
+                onClick={() => setPage(p)}
+                className={`w-8 h-8 flex items-center justify-center rounded text-sm font-medium transition-colors ${
+                  p === page
+                    ? "bg-emerald-700 text-white"
+                    : "border border-slate-200 text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                {p}
+              </button>
+            ))}
+            <button
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={page === totalPages}
+              className="w-8 h-8 flex items-center justify-center rounded border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Floating bulk-action bar (keeps the table from shifting) */}
+      {selectedBooks.length > 0 && (
+        <>
+          {/* Spacer so the bar never covers the pagination */}
+          <div className="h-20 no-print" aria-hidden />
+          <div
+            role="toolbar"
+            aria-label="Bulk actions"
+            className="fixed z-40 bottom-4 inset-x-4 sm:inset-x-auto sm:left-1/2 sm:-translate-x-1/2 lg:left-[calc(50%+8rem)] flex items-center gap-3 sm:gap-4 pl-4 pr-2 py-2 rounded-xl bg-slate-900 text-white shadow-2xl animate-fade-in-up no-print"
+          >
+            <div className="flex-1 sm:flex-none min-w-0 text-sm whitespace-nowrap">
+              <span className="font-semibold">{selectedBooks.length}</span> selected
+              {!allFilteredSelected && filtered.length > pageBooks.length && (
+                <button
+                  onClick={selectAllFiltered}
+                  className="hidden sm:inline ml-3 text-emerald-300 hover:text-emerald-200 font-medium"
+                >
+                  Select all {filtered.length}
+                </button>
+              )}
+            </div>
+            <div className="h-6 w-px bg-slate-700 hidden sm:block" />
+            <button
+              onClick={() => setShowBulkPrint(true)}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-500 transition-colors whitespace-nowrap"
+            >
+              <Printer className="w-4 h-4" />
+              Print QR Codes
+            </button>
+            <button
+              onClick={clearSelection}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+              title="Clear selection"
+              aria-label="Clear selection"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* Add Book Modal */}
+      <BookFormModal
+        open={showAddModal}
+        title="Add New Book"
+        subtitle="Enter the book details below."
+        form={form}
+        setForm={setForm}
+        formError={formError}
+        classifications={classifications}
+        submitting={submitting}
+        isEdit={false}
+        onSubmit={handleAddSubmit}
+        onClose={() => setShowAddModal(false)}
+      />
+
+      {/* Edit Book Modal */}
+      <BookFormModal
+        open={showEditModal}
+        title="Edit Book"
+        subtitle={editingBook ? `Updating "${editingBook.title}"` : undefined}
+        form={form}
+        setForm={setForm}
+        formError={formError}
+        classifications={classifications}
+        submitting={submitting}
+        isEdit={true}
+        onSubmit={handleEditSubmit}
+        onClose={() => { setShowEditModal(false); setEditingBook(null); }}
+      />
+
+      {/* Delete Confirm Modal */}
+      <ConfirmModal
+        open={!!deletingBook}
+        onClose={() => { setDeletingBook(null); setDeleteError(null); }}
+        onConfirm={handleDelete}
+        title="Delete Book"
+        message={deleteError ?? (deletingBook ? `Delete "${deletingBook.title}" by ${deletingBook.author}? This cannot be undone.` : "")}
+        confirmLabel="Delete"
+        confirming={deleting}
+      />
+
+      {/* Print QR Modal */}
+      <Modal
+        open={!!printingBook}
+        onClose={() => setPrintingBook(null)}
+        title="Print QR Code"
+        subtitle={printingBook ? printingBook.title : undefined}
+        size="sm"
+        footer={
+          <button
+            onClick={printLabel}
+            className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 transition-colors"
+          >
+            <Printer className="w-4 h-4" />
+            Print Label
+          </button>
+        }
+      >
+        {printingBook && (
+          <div className="flex flex-col items-center">
+            <QRCodeSVG
+              value={getQrUrl(printingBook.id)}
+              size={180}
+              level="M"
+              includeMargin
+            />
+            <div className="mt-4 text-center">
+              <p className="text-sm font-bold text-slate-900">{printingBook.title}</p>
+              <p className="text-xs text-slate-500">{printingBook.author}</p>
+              <p className="text-xs text-slate-400 mt-1">Accession #: {printingBook.accession_number}</p>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Bulk Print QR Modal */}
+      <Modal
+        open={showBulkPrint && !printingBook}
+        onClose={() => setShowBulkPrint(false)}
+        title="Print QR Codes"
+        subtitle={`${selectedBooks.length} label${selectedBooks.length === 1 ? "" : "s"} will be printed`}
+        size="lg"
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={() => setShowBulkPrint(false)}
+              className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={printLabel}
+              disabled={selectedBooks.length === 0}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 transition-colors disabled:opacity-50"
+            >
+              <Printer className="w-4 h-4" />
+              Print {selectedBooks.length} Label{selectedBooks.length === 1 ? "" : "s"}
+            </button>
+          </>
+        }
+      >
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          {selectedBooks.map((book) => (
+            <div key={book.id} className="relative flex flex-col items-center p-3 rounded-lg border border-slate-200">
+              <button
+                onClick={() => toggleSelect(book.id)}
+                className="absolute top-1 right-1 p-1 rounded text-slate-300 hover:text-red-600 hover:bg-red-50 transition-colors"
+                title="Remove from print"
+                aria-label={`Remove ${book.title} from print`}
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+              <QRCodeSVG value={getQrUrl(book.id)} size={96} level="M" includeMargin />
+              <p className="mt-2 text-xs font-semibold text-slate-900 text-center line-clamp-2">{book.title}</p>
+              <p className="text-[11px] text-slate-400 font-mono text-center break-all">{book.accession_number}</p>
+            </div>
+          ))}
+        </div>
+      </Modal>
+
+      {/* Print-only QR label sheet (single or bulk) */}
+      {labelBooks.length > 0 && (
+        <div data-print-labels className="hidden">
+          {labelBooks.map((book) => (
+            <div key={book.id} className="qr-label">
+              <QRCodeSVG value={getQrUrl(book.id)} size={140} level="M" includeMargin />
+              <p className="qr-label-title">{book.title}</p>
+              <p className="qr-label-meta">{book.author}</p>
+              <p className="qr-label-meta">Accession #: {book.accession_number}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
