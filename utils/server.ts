@@ -1,16 +1,16 @@
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 import { createMockSupabaseClient } from "./mock-supabase";
-
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+import { getRuntimeServerSupabaseConfig } from "@/lib/supabase-env";
 
 export const createClient = (
   cookieStore: Awaited<ReturnType<typeof cookies>>
 ) => {
+  const { url: supabaseUrl, key: supabaseKey } = getRuntimeServerSupabaseConfig();
+
   if (!supabaseUrl || !supabaseKey) {
     console.warn(
-      "[AI Studio] Supabase env vars not configured — using mock client"
+      "[BCAS Library] Supabase env vars not configured — using mock client"
     );
     return createMockSupabaseClient() as never;
   }

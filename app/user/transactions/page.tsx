@@ -1,7 +1,21 @@
 "use client";
 
 import { useState, useEffect, useMemo } from "react";
-import { Download, DollarSign, User, Hash, BookOpen, GraduationCap, Layers, Printer, Pencil, Trash2, ShieldAlert, CheckCircle2 } from "lucide-react";
+import {
+  Download,
+  User,
+  Hash,
+  BookOpen,
+  GraduationCap,
+  Layers,
+  Printer,
+  Pencil,
+  Trash2,
+  ShieldAlert,
+  ShieldCheck,
+  AlertTriangle,
+  Ban,
+} from "lucide-react";
 import PageHeader from "@/components/ui/page-header";
 import Modal, { ConfirmModal } from "@/components/ui/modal";
 import SearchInput from "@/components/ui/search-input";
@@ -14,38 +28,56 @@ import {
   getTransactions,
   updateTransactionDetails,
   deleteTransaction,
-  computeEffectiveFine,
 } from "@/lib/supabase/transactions";
-import { getFineSettings, payFine } from "@/lib/supabase/fines";
+import {
+  evaluateAllStudentViolations,
+  formatBanDuration,
+  formatOrdinal,
+  getDefaultViolationPolicy,
+  getViolationPolicy,
+  setTransactionViolationCleared,
+} from "@/lib/supabase/violations";
+import {
+  getSchoolYears,
+  resolveTransactionSchoolYearId,
+} from "@/lib/supabase/school-years";
+import { formatDateTime } from "@/lib/reports-excel";
 import { ensureServerNow, getServerDateString, getServerNow } from "@/lib/server-clock";
 import { requestPrint } from "@/lib/print";
-import type { BorrowingTransactionWithDetails, FineSetting, StaffRole } from "@/lib/types";
+import type {
+  BorrowingTransactionWithDetails,
+  SchoolYear,
+  StaffRole,
+  StudentViolationIncident,
+  ViolationPolicy,
+} from "@/lib/types";
 
 export default function TransactionsPage() {
   const [search, setSearch] = useState("");
+  const [schoolYearFilter, setSchoolYearFilter] = useState("all");
   const [dateRange, setDateRange] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
   const [allTransactions, setAllTransactions] = useState<BorrowingTransactionWithDetails[]>([]);
-  const [fineSettings, setFineSettings] = useState<Pick<FineSetting, "fine_rate_per_day" | "max_fine">>({
-    fine_rate_per_day: 5,
-    max_fine: 500,
-  });
+  const [schoolYears, setSchoolYears] = useState<SchoolYear[]>([]);
+  const [policy, setPolicy] = useState<ViolationPolicy>(() => getDefaultViolationPolicy());
+  const [serverNow, setServerNow] = useState<Date>(() => getServerNow());
   const [loading, setLoading] = useState(true);
   const [selectedStudent, setSelectedStudent] = useState<BorrowingTransactionWithDetails["students"] | null>(null);
   const [role, setRole] = useState<StaffRole | null>(null);
 
-  // Only an explicit Staff role is restricted (session loads async).
   const allowEdit = role ? canEdit(role) : true;
   const allowDelete = role ? canDelete(role) : true;
   const staffRestricted = role === "Staff";
 
-  // Edit / delete / pay fine state
+  // Edit / delete / clear violation state
   const [editingTx, setEditingTx] = useState<BorrowingTransactionWithDetails | null>(null);
   const [editDueDate, setEditDueDate] = useState("");
-  const [editFine, setEditFine] = useState("0.00");
-  const [editFinePaid, setEditFinePaid] = useState(false);
+  const [editViolationCleared, setEditViolationCleared] = useState(false);
   const [deletingTx, setDeletingTx] = useState<BorrowingTransactionWithDetails | null>(null);
-  const [payingTx, setPayingTx] = useState<{ tx: BorrowingTransactionWithDetails; amount: number } | null>(null);
+  const [clearingIncident, setClearingIncident] = useState<{
+    tx: BorrowingTransactionWithDetails;
+    incident: StudentViolationIncident;
+  } | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
@@ -53,17 +85,17 @@ export default function TransactionsPage() {
   useEffect(() => {
     async function fetch() {
       try {
-        const [data, session, settings] = await Promise.all([
+        const [data, session, violationPolicy, years, now] = await Promise.all([
           getTransactions(),
           getEffectiveSession(),
-          getFineSettings(),
+          getViolationPolicy(),
+          getSchoolYears().catch(() => [] as SchoolYear[]),
           ensureServerNow(),
         ]);
         setAllTransactions(data);
-        setFineSettings({
-          fine_rate_per_day: settings.fine_rate_per_day,
-          max_fine: settings.max_fine,
-        });
+        setPolicy(violationPolicy);
+        setSchoolYears(years);
+        setServerNow(now);
         if (session) setRole(session.role);
       } catch {
         // silent
@@ -75,19 +107,37 @@ export default function TransactionsPage() {
   }, []);
 
   const reload = async () => {
-    const [data, settings] = await Promise.all([getTransactions(), getFineSettings()]);
+    const [data, violationPolicy, years, now] = await Promise.all([
+      getTransactions(),
+      getViolationPolicy(),
+      getSchoolYears().catch(() => [] as SchoolYear[]),
+      ensureServerNow(),
+    ]);
     setAllTransactions(data);
-    setFineSettings({
-      fine_rate_per_day: settings.fine_rate_per_day,
-      max_fine: settings.max_fine,
-    });
+    setPolicy(violationPolicy);
+    setSchoolYears(years);
+    setServerNow(now);
   };
 
+  const violationBundle = useMemo(
+    () => evaluateAllStudentViolations(allTransactions, policy, serverNow),
+    [allTransactions, policy, serverNow]
+  );
+
+  const selectedSchoolYear = useMemo(
+    () => schoolYears.find((y) => y.id === schoolYearFilter) ?? null,
+    [schoolYears, schoolYearFilter]
+  );
+
   const filtered = useMemo(() => {
-    const now = getServerNow();
     return allTransactions.filter((tx) => {
+      if (schoolYearFilter !== "all") {
+        const txSyId = resolveTransactionSchoolYearId(tx, schoolYears);
+        if (txSyId !== schoolYearFilter) return false;
+      }
+
       const txDate = new Date(tx.date_borrowed);
-      const diffDays = (now.getTime() - txDate.getTime()) / (1000 * 60 * 60 * 24);
+      const diffDays = (serverNow.getTime() - txDate.getTime()) / (1000 * 60 * 60 * 24);
       const matchesDateRange =
         dateRange === "all" ||
         (dateRange === "7d" && diffDays <= 7) ||
@@ -103,77 +153,66 @@ export default function TransactionsPage() {
 
       const isOverdue =
         tx.status === "Overdue" ||
-        (tx.status === "Active" && new Date(tx.due_date) < now);
-      const { amount: effectiveFine } = computeEffectiveFine(
-        tx,
-        fineSettings.fine_rate_per_day,
-        fineSettings.max_fine,
-        now
-      );
+        (tx.status === "Active" && new Date(tx.due_date) < serverNow);
+      const incident = violationBundle.byTransactionId.get(tx.id);
 
       const matchesType =
         typeFilter === "all" ||
-        (typeFilter === "Borrow" && tx.status === "Active") ||
+        (typeFilter === "Borrow" && tx.status === "Active" && !isOverdue) ||
         (typeFilter === "Return" && tx.status === "Returned") ||
         (typeFilter === "Overdue" && isOverdue) ||
-        (typeFilter === "Fine" && effectiveFine > 0);
+        (typeFilter === "Violation" && Boolean(incident));
 
       return matchesDateRange && matchesSearch && matchesType;
     });
-  }, [allTransactions, search, dateRange, typeFilter, fineSettings]);
+  }, [allTransactions, schoolYearFilter, schoolYears, search, dateRange, typeFilter, serverNow, violationBundle]);
 
-  const totalFines = useMemo(() => {
-    const now = getServerNow();
-    return filtered.reduce(
-      (sum, tx) =>
-        sum +
-        computeEffectiveFine(tx, fineSettings.fine_rate_per_day, fineSettings.max_fine, now).amount,
-      0
-    );
-  }, [filtered, fineSettings]);
+  const filteredViolationCounts = useMemo(() => {
+    let active = 0;
+    let cleared = 0;
+    const bannedIds = new Set<string>();
+    for (const tx of filtered) {
+      const inc = violationBundle.byTransactionId.get(tx.id);
+      if (!inc) continue;
+      if (inc.cleared) {
+        cleared += 1;
+      } else {
+        active += 1;
+        const st = violationBundle.byStudentId.get(tx.student_id);
+        if (st?.isBanned) bannedIds.add(tx.student_id);
+      }
+    }
+    return { active, cleared, restrictedStudents: bannedIds.size };
+  }, [filtered, violationBundle]);
 
-  const pendingFines = useMemo(() => {
-    const now = getServerNow();
-    return filtered
-      .filter((tx) => !tx.fine_paid)
-      .reduce(
-        (sum, tx) =>
-          sum +
-          computeEffectiveFine(tx, fineSettings.fine_rate_per_day, fineSettings.max_fine, now).amount,
-        0
-      );
-  }, [filtered, fineSettings]);
+  const describeIncidentText = (inc: StudentViolationIncident | undefined): string => {
+    if (!inc) return "None";
+    if (inc.cleared) return "Cleared / Excused";
+    const rule = inc.ruleApplied;
+    const effect =
+      rule?.action === "ban" && rule.banDays > 0
+        ? formatBanDuration(rule.banDays) + " ban"
+        : rule?.label ?? "Warning";
+    return `${formatOrdinal(inc.offenseNumber)} Violation (${effect})`;
+  };
 
   const handleExportCSV = () => {
     const header =
-      "Date Borrowed,Date Returned,Due Date,Student,Student Number,Book,Author,Status,Fine (PHP),Fine Status,Handled By,Handler Role\n";
+      "Borrowed Date & Time,Returned Date & Time,Due Date & Time,Student,Student Number,Book,Author,Status,Violation Status,Handled By,Handler Role\n";
     const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
     const body = filtered
       .map((tx) => {
-        const { amount, isAccruing } = computeEffectiveFine(
-          tx,
-          fineSettings.fine_rate_per_day,
-          fineSettings.max_fine
-        );
-        const fineStatus =
-          amount <= 0
-            ? ""
-            : tx.fine_paid
-            ? "Paid"
-            : isAccruing
-            ? "Accruing"
-            : "Unpaid";
+        const inc = violationBundle.byTransactionId.get(tx.id);
         return [
-          esc(new Date(tx.date_borrowed).toLocaleString()),
-          esc(tx.date_returned ? new Date(tx.date_returned).toLocaleString() : ""),
-          esc(new Date(tx.due_date).toLocaleString()),
+          esc(formatDateTime(tx.date_borrowed)),
+          esc(tx.date_returned ? formatDateTime(tx.date_returned) : ""),
+          esc(formatDateTime(tx.due_date)),
           esc(tx.students?.name ?? ""),
           esc(tx.students?.student_number ?? ""),
           esc(tx.books?.title ?? ""),
           esc(tx.books?.author ?? ""),
           esc(tx.status),
-          amount.toFixed(2),
-          esc(fineStatus),
+          esc(describeIncidentText(inc)),
           esc(tx.handled_by_name ?? ""),
           esc(tx.handled_by_role ?? ""),
         ].join(",");
@@ -182,46 +221,35 @@ export default function TransactionsPage() {
     const blob = new Blob(["\uFEFF" + header + body], { type: "text/csv;charset=utf-8;" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = `transactions_${getServerDateString()}.csv`;
+    link.download = `transactions_violations_${getServerDateString()}.csv`;
     link.click();
     URL.revokeObjectURL(link.href);
   };
 
   const handlePrint = () => {
     requestPrint({
-      title: "Transactions & Fines Ledger",
+      title: "Transactions & Student Violations Log",
       filename: `bcas_transactions_print_${getServerDateString()}.html`,
     });
   };
 
   const openEditModal = (tx: BorrowingTransactionWithDetails) => {
     if (!allowEdit) return;
-    const { amount } = computeEffectiveFine(
-      tx,
-      fineSettings.fine_rate_per_day,
-      fineSettings.max_fine
-    );
     setEditingTx(tx);
     setEditDueDate(tx.due_date ? new Date(tx.due_date).toISOString().split("T")[0] : "");
-    setEditFine(amount.toFixed(2));
-    setEditFinePaid(!!tx.fine_paid);
+    setEditViolationCleared(Boolean(tx.fine_paid));
     setModalError(null);
   };
 
   const handleEditSubmit = async () => {
     if (!editingTx || !allowEdit) return;
-    const fine = parseFloat(editFine);
-    if (Number.isNaN(fine) || fine < 0) {
-      setModalError("Enter a valid fine amount.");
-      return;
-    }
     setBusy(true);
     setModalError(null);
     try {
       await updateTransactionDetails(editingTx.id, {
         due_date: editDueDate || undefined,
-        fine_amount: fine,
-        fine_paid: editFinePaid,
+        fine_amount: 0,
+        fine_paid: editViolationCleared,
       });
       setEditingTx(null);
       await reload();
@@ -232,16 +260,16 @@ export default function TransactionsPage() {
     }
   };
 
-  const handleMarkPaid = async () => {
-    if (!payingTx || !allowEdit) return;
+  const handleClearViolation = async () => {
+    if (!clearingIncident || !allowEdit) return;
     setBusy(true);
     setModalError(null);
     try {
-      await payFine(payingTx.tx.id);
-      setPayingTx(null);
+      await setTransactionViolationCleared(clearingIncident.tx.id, true);
+      setClearingIncident(null);
       await reload();
     } catch (e) {
-      setModalError(e instanceof Error ? e.message : "Failed to mark fine as paid.");
+      setModalError(e instanceof Error ? e.message : "Failed to clear violation.");
     } finally {
       setBusy(false);
     }
@@ -267,9 +295,11 @@ export default function TransactionsPage() {
       header: "Date & Time",
       render: (row: BorrowingTransactionWithDetails) => (
         <div>
-          <div className="text-slate-800">{new Date(row.date_borrowed).toLocaleDateString()}</div>
+          <div className="text-slate-800">{formatDateTime(row.date_borrowed)}</div>
           <div className="text-xs text-slate-500">
-            {row.date_returned ? `Returned ${new Date(row.date_returned).toLocaleDateString()}` : `Due ${new Date(row.due_date).toLocaleDateString()}`}
+            {row.date_returned
+              ? `Returned ${formatDateTime(row.date_returned)}`
+              : `Due ${formatDateTime(row.due_date)}`}
           </div>
         </div>
       ),
@@ -300,27 +330,36 @@ export default function TransactionsPage() {
       render: (row: BorrowingTransactionWithDetails) => <Badge label={row.status} />,
     },
     {
-      key: "fine",
-      header: "Fine",
+      key: "violation",
+      header: "Violation",
       render: (row: BorrowingTransactionWithDetails) => {
-        const { amount, isAccruing } = computeEffectiveFine(
-          row,
-          fineSettings.fine_rate_per_day,
-          fineSettings.max_fine
-        );
-        if (amount <= 0) return <span className="text-slate-400">—</span>;
-        return (
-          <div className="flex items-center gap-1">
-            <span className={row.fine_paid ? "text-emerald-600 font-medium" : "text-amber-600 font-medium"}>
-              ₱{amount.toFixed(2)}
+        const inc = violationBundle.byTransactionId.get(row.id);
+        if (!inc) return <span className="text-slate-400">—</span>;
+        if (inc.cleared) {
+          return (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+              <ShieldCheck className="w-3.5 h-3.5" />
+              Cleared
             </span>
-            {row.fine_paid ? (
-              <span className="text-xs text-emerald-600 ml-0.5">(Paid)</span>
-            ) : isAccruing ? (
-              <span className="text-xs text-amber-600 ml-0.5">(Accruing)</span>
-            ) : (
-              <span className="text-xs text-amber-600 ml-0.5">(Unpaid)</span>
-            )}
+          );
+        }
+        const isBan = inc.ruleApplied?.action === "ban" && (inc.ruleApplied.banDays ?? 0) > 0;
+        return (
+          <div>
+            <span
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-semibold ${
+                isBan
+                  ? "bg-red-100 text-red-700"
+                  : "bg-amber-100 text-amber-800"
+              }`}
+            >
+              {isBan ? <Ban className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
+              {formatOrdinal(inc.offenseNumber)} —{" "}
+              {isBan
+                ? `${inc.ruleApplied!.banDays}d Ban`
+                : inc.ruleApplied?.label ?? "Warning"}
+            </span>
+            <div className="text-[11px] text-slate-500 mt-0.5">{inc.overdueLabel} late</div>
           </div>
         );
       },
@@ -344,29 +383,39 @@ export default function TransactionsPage() {
       key: "actions",
       header: "Actions",
       render: (row: BorrowingTransactionWithDetails) => {
-        const { amount } = computeEffectiveFine(
-          row,
-          fineSettings.fine_rate_per_day,
-          fineSettings.max_fine
-        );
+        const inc = violationBundle.byTransactionId.get(row.id);
         return (
           <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-            {allowEdit && amount > 0 && !row.fine_paid && (
+            {allowEdit && inc && !inc.cleared && (
               <button
-                onClick={() => { setModalError(null); setPayingTx({ tx: row, amount }); }}
+                onClick={() => {
+                  setModalError(null);
+                  setClearingIncident({ tx: row, incident: inc });
+                }}
                 className="text-emerald-600 hover:text-emerald-800 transition-colors"
-                title="Mark fine as paid"
+                title="Clear / excuse violation"
               >
-                <CheckCircle2 className="w-4 h-4" />
+                <ShieldCheck className="w-4 h-4" />
               </button>
             )}
             {allowEdit && (
-              <button onClick={() => openEditModal(row)} className="text-slate-400 hover:text-slate-600 transition-colors" title="Edit transaction">
+              <button
+                onClick={() => openEditModal(row)}
+                className="text-slate-400 hover:text-slate-600 transition-colors"
+                title="Edit transaction"
+              >
                 <Pencil className="w-4 h-4" />
               </button>
             )}
             {allowDelete && (
-              <button onClick={() => { setModalError(null); setDeletingTx(row); }} className="text-slate-400 hover:text-red-600 transition-colors" title="Delete transaction">
+              <button
+                onClick={() => {
+                  setModalError(null);
+                  setDeletingTx(row);
+                }}
+                className="text-slate-400 hover:text-red-600 transition-colors"
+                title="Delete transaction"
+              >
                 <Trash2 className="w-4 h-4" />
               </button>
             )}
@@ -376,165 +425,184 @@ export default function TransactionsPage() {
     },
   ].filter((col) => col.key !== "actions" || allowEdit || allowDelete);
 
+  const selectedStudentViolation = selectedStudent
+    ? violationBundle.byStudentId.get(selectedStudent.id)
+    : undefined;
+
   return (
     <>
       <div className="animate-fade-in-up stagger-1 no-print">
         <PageHeader
-        title="Transactions"
-        actions={
-          <>
-            <Select
-              value={dateRange}
-              onChange={setDateRange}
-              options={[
-                { label: "Last 7 Days", value: "7d" },
-                { label: "Last 30 Days", value: "30d" },
-                { label: "Last 90 Days", value: "90d" },
-                { label: "All Time", value: "all" },
-              ]}
-            />
-            <Select
-              value={typeFilter}
-              onChange={setTypeFilter}
-              options={[
-                { label: "All Types", value: "all" },
-                { label: "Borrow", value: "Borrow" },
-                { label: "Return", value: "Return" },
-                { label: "Overdue", value: "Overdue" },
-                { label: "With Fine", value: "Fine" },
-              ]}
-            />
-            <button onClick={handleExportCSV} className="flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 bg-white hover:bg-slate-50 transition-colors no-print">
-              <Download className="w-4 h-4" />
-              Export
-            </button>
-            <button onClick={handlePrint} className="hidden sm:flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 bg-white hover:bg-slate-50 transition-colors no-print">
-              <Printer className="w-4 h-4" />
-              Print
-            </button>
-          </>
-        }
-      />
+          title="Transactions"
+          actions={
+            <>
+              <Select
+                value={dateRange}
+                onChange={setDateRange}
+                options={[
+                  { label: "Last 7 Days", value: "7d" },
+                  { label: "Last 30 Days", value: "30d" },
+                  { label: "Last 90 Days", value: "90d" },
+                  { label: "All Time", value: "all" },
+                ]}
+              />
+              {schoolYears.length > 0 && (
+                <Select
+                  value={schoolYearFilter}
+                  onChange={setSchoolYearFilter}
+                  options={[
+                    { label: "All School Years", value: "all" },
+                    ...schoolYears.map((y) => ({
+                      label: `SY ${y.name}${y.is_active ? " (Active)" : ""}`,
+                      value: y.id,
+                    })),
+                  ]}
+                />
+              )}
+              <Select
+                value={typeFilter}
+                onChange={setTypeFilter}
+                options={[
+                  { label: "All Types", value: "all" },
+                  { label: "Borrow (On Time)", value: "Borrow" },
+                  { label: "Return", value: "Return" },
+                  { label: "Overdue", value: "Overdue" },
+                  { label: "With Violation", value: "Violation" },
+                ]}
+              />
+              <button
+                onClick={handleExportCSV}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 bg-white hover:bg-slate-50 transition-colors no-print"
+              >
+                <Download className="w-4 h-4" />
+                Export
+              </button>
+              <button
+                onClick={handlePrint}
+                className="hidden sm:flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 bg-white hover:bg-slate-50 transition-colors no-print"
+              >
+                <Printer className="w-4 h-4" />
+                Print
+              </button>
+            </>
+          }
+        />
       </div>
 
       {staffRestricted && (
         <div className="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-200 flex items-start gap-2 text-sm text-amber-800 animate-fade-in-up stagger-2 no-print">
           <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
-          <span>Borrows are recorded automatically via Borrow/Return scanning. Editing or deleting a transaction requires a Librarian or Admin.</span>
+          <span>Borrows are recorded automatically via Borrow/Return scanning. Editing, clearing violations, or deleting a transaction requires a Librarian or Admin.</span>
         </div>
       )}
 
       <div data-print-area className="space-y-4">
         {/* Print-only formal header */}
         <div className="hidden print:block pb-3 border-b border-slate-300">
-          <h2 className="text-xl font-bold text-slate-900">BCAS Library — Transactions &amp; Fines Ledger</h2>
+          <h2 className="text-xl font-bold text-slate-900">BCAS Library — Transactions &amp; Student Violations Log</h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Generated {getServerNow().toLocaleString()} • {filtered.length} record(s) • Total Fines: ₱{totalFines.toFixed(2)} • Pending: ₱{pendingFines.toFixed(2)} • Collected: ₱{(totalFines - pendingFines).toFixed(2)}
+            Generated {formatDateTime(serverNow.toISOString())} • School Year: {selectedSchoolYear ? `SY ${selectedSchoolYear.name}` : "All School Years"} • {filtered.length} record(s) • Active Violations: {filteredViolationCounts.active} • Restricted Students: {filteredViolationCounts.restrictedStudents} • Cleared: {filteredViolationCounts.cleared}
           </p>
         </div>
 
-        {/* Fine Summary (visible on screen and print) */}
-        {totalFines > 0 && (
+        {/* Violation Summary (visible on screen and print) */}
+        {(filteredViolationCounts.active > 0 || filteredViolationCounts.cleared > 0) && (
           <div className="p-4 bg-amber-50 rounded-xl border border-amber-200 animate-fade-in-up stagger-2 print-avoid-break">
             <div className="flex items-center gap-2 mb-2">
-              <DollarSign className="w-5 h-5 text-amber-600" />
-              <span className="font-semibold text-amber-800">Fine Summary</span>
+              <ShieldAlert className="w-5 h-5 text-amber-600" />
+              <span className="font-semibold text-amber-900">Student Violation Summary</span>
             </div>
-            <div className="grid grid-cols-3 gap-4 text-sm">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
               <div>
-                <span className="text-amber-600">Total Fines:</span>
-                <span className="ml-2 font-medium text-amber-800">₱{totalFines.toFixed(2)}</span>
+                <span className="text-amber-700">Active Violations:</span>
+                <span className="ml-2 font-semibold text-amber-900">{filteredViolationCounts.active}</span>
               </div>
               <div>
-                <span className="text-amber-600">Pending:</span>
-                <span className="ml-2 font-medium text-amber-800">₱{pendingFines.toFixed(2)}</span>
+                <span className="text-amber-700">Borrowing Restricted:</span>
+                <span className="ml-2 font-semibold text-red-700">
+                  {filteredViolationCounts.restrictedStudents} student{filteredViolationCounts.restrictedStudents === 1 ? "" : "s"}
+                </span>
               </div>
               <div>
-                <span className="text-amber-600">Collected:</span>
-                <span className="ml-2 font-medium text-emerald-700">₱{(totalFines - pendingFines).toFixed(2)}</span>
+                <span className="text-amber-700">Cleared / Excused:</span>
+                <span className="ml-2 font-semibold text-emerald-700">{filteredViolationCounts.cleared}</span>
               </div>
             </div>
           </div>
         )}
 
-      <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-5 animate-fade-in-up stagger-3">
-        <div className="mb-5 no-print">
-          <SearchInput
-            value={search}
-            onChange={setSearch}
-            placeholder="Search by student or book title..."
-          />
-        </div>
-        {loading ? (
-          <div className="py-12 text-center text-slate-400 text-sm">Loading transactions...</div>
-        ) : (
-          <>
-            <div className="print:hidden">
-              <DataTable
-                columns={columns}
-                data={filtered}
-                pageSize={5}
-                keyExtractor={(row) => row.id}
-                onRowClick={(row) => setSelectedStudent(row.students)}
-                emptyMessage="No transactions found."
-              />
-            </div>
-            {/* Print-only full list (screen table is paginated) */}
-            <div className="hidden print:block">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-slate-200">
-                    <th className="text-left px-2 py-2 font-semibold text-slate-500">Date Borrowed</th>
-                    <th className="text-left px-2 py-2 font-semibold text-slate-500">Student</th>
-                    <th className="text-left px-2 py-2 font-semibold text-slate-500">Book</th>
-                    <th className="text-left px-2 py-2 font-semibold text-slate-500">Status</th>
-                    <th className="text-left px-2 py-2 font-semibold text-slate-500">Fine</th>
-                    <th className="text-left px-2 py-2 font-semibold text-slate-500">Handled By</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filtered.map((tx) => (
-                    <tr key={tx.id} className="border-b border-slate-100">
-                      <td className="px-2 py-2 text-slate-600">
-                        {new Date(tx.date_borrowed).toLocaleDateString()}
-                        <div className="text-xs text-slate-400">
-                          {tx.date_returned ? `Returned ${new Date(tx.date_returned).toLocaleDateString()}` : `Due ${new Date(tx.due_date).toLocaleDateString()}`}
-                        </div>
-                      </td>
-                      <td className="px-2 py-2">
-                        <div className="font-medium text-slate-800">{tx.students?.name ?? "—"}</div>
-                        <div className="text-xs text-slate-500">{tx.students?.student_number || tx.students?.section || ""}</div>
-                      </td>
-                      <td className="px-2 py-2">
-                        <div className="font-medium text-slate-800">{tx.books?.title ?? "—"}</div>
-                        <div className="text-xs text-slate-500">{tx.books?.author ?? ""}</div>
-                      </td>
-                      <td className="px-2 py-2 text-slate-600">{tx.status}</td>
-                      <td className="px-2 py-2 text-slate-600">
-                        {(() => {
-                          const { amount, isAccruing } = computeEffectiveFine(
-                            tx,
-                            fineSettings.fine_rate_per_day,
-                            fineSettings.max_fine
-                          );
-                          if (amount <= 0) return "—";
-                          return `₱${amount.toFixed(2)}${tx.fine_paid ? " (Paid)" : isAccruing ? " (Accruing)" : " (Unpaid)"}`;
-                        })()}
-                      </td>
-                      <td className="px-2 py-2 text-slate-600">
-                        {tx.handled_by_name ? `${tx.handled_by_name}${tx.handled_by_role ? ` (${tx.handled_by_role})` : ""}` : "—"}
-                      </td>
+        <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-5 animate-fade-in-up stagger-3">
+          <div className="mb-5 no-print">
+            <SearchInput
+              value={search}
+              onChange={setSearch}
+              placeholder="Search by student or book title..."
+            />
+          </div>
+          {loading ? (
+            <div className="py-12 text-center text-slate-400 text-sm">Loading transactions...</div>
+          ) : (
+            <>
+              <div className="print:hidden">
+                <DataTable
+                  columns={columns}
+                  data={filtered}
+                  pageSize={5}
+                  keyExtractor={(row) => row.id}
+                  onRowClick={(row) => setSelectedStudent(row.students)}
+                  emptyMessage="No transactions found."
+                />
+              </div>
+              {/* Print-only full list */}
+              <div className="hidden print:block">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-200">
+                      <th className="text-left px-2 py-2 font-semibold text-slate-500">Date &amp; Time</th>
+                      <th className="text-left px-2 py-2 font-semibold text-slate-500">Student</th>
+                      <th className="text-left px-2 py-2 font-semibold text-slate-500">Book</th>
+                      <th className="text-left px-2 py-2 font-semibold text-slate-500">Status</th>
+                      <th className="text-left px-2 py-2 font-semibold text-slate-500">Violation</th>
+                      <th className="text-left px-2 py-2 font-semibold text-slate-500">Handled By</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-              {filtered.length === 0 && (
-                <p className="py-8 text-center text-slate-400 text-sm">No transactions found.</p>
-              )}
-            </div>
-          </>
-        )}
-      </div>
+                  </thead>
+                  <tbody>
+                    {filtered.map((tx) => (
+                      <tr key={tx.id} className="border-b border-slate-100">
+                        <td className="px-2 py-2 text-slate-600">
+                          {formatDateTime(tx.date_borrowed)}
+                          <div className="text-xs text-slate-400">
+                            {tx.date_returned
+                              ? `Returned ${formatDateTime(tx.date_returned)}`
+                              : `Due ${formatDateTime(tx.due_date)}`}
+                          </div>
+                        </td>
+                        <td className="px-2 py-2">
+                          <div className="font-medium text-slate-800">{tx.students?.name ?? "—"}</div>
+                          <div className="text-xs text-slate-500">{tx.students?.student_number || tx.students?.section || ""}</div>
+                        </td>
+                        <td className="px-2 py-2">
+                          <div className="font-medium text-slate-800">{tx.books?.title ?? "—"}</div>
+                          <div className="text-xs text-slate-500">{tx.books?.author ?? ""}</div>
+                        </td>
+                        <td className="px-2 py-2 text-slate-600">{tx.status}</td>
+                        <td className="px-2 py-2 text-slate-600">
+                          {describeIncidentText(violationBundle.byTransactionId.get(tx.id))}
+                        </td>
+                        <td className="px-2 py-2 text-slate-600">
+                          {tx.handled_by_name ? `${tx.handled_by_name}${tx.handled_by_role ? ` (${tx.handled_by_role})` : ""}` : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {filtered.length === 0 && (
+                  <p className="py-8 text-center text-slate-400 text-sm">No transactions found.</p>
+                )}
+              </div>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Edit Transaction Modal */}
@@ -575,44 +643,40 @@ export default function TransactionsPage() {
               className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
             />
           </div>
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Fine Amount (₱)</label>
-            <input
-              type="number"
-              step="0.01"
-              min="0"
-              value={editFine}
-              onChange={(e) => setEditFine(e.target.value)}
-              className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
-            />
-          </div>
-          <div>
-            <label className="flex items-center gap-2 cursor-pointer">
+          <div className="p-3 rounded-lg bg-slate-50 border border-slate-200">
+            <label className="flex items-start gap-2.5 cursor-pointer">
               <input
                 type="checkbox"
-                checked={editFinePaid}
-                onChange={(e) => setEditFinePaid(e.target.checked)}
-                className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                checked={editViolationCleared}
+                onChange={(e) => setEditViolationCleared(e.target.checked)}
+                className="w-4 h-4 mt-0.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
               />
-              <span className="text-sm font-medium text-slate-700">Fine paid</span>
+              <div>
+                <span className="text-sm font-medium text-slate-700 block">
+                  Clear / Excuse Violation
+                </span>
+                <span className="text-xs text-slate-500">
+                  Removes this transaction from the student&apos;s violation count and lifts any ban it caused.
+                </span>
+              </div>
             </label>
           </div>
         </div>
       </Modal>
 
-      {/* Pay Fine Confirm Modal */}
+      {/* Clear Violation Confirm Modal */}
       <ConfirmModal
-        open={!!payingTx}
-        onClose={() => { setPayingTx(null); setModalError(null); }}
-        onConfirm={handleMarkPaid}
-        title="Mark Fine as Paid"
+        open={!!clearingIncident}
+        onClose={() => { setClearingIncident(null); setModalError(null); }}
+        onConfirm={handleClearViolation}
+        title="Clear / Excuse Violation"
         message={
           modalError ??
-          (payingTx
-            ? `Record payment of ₱${payingTx.amount.toFixed(2)} for "${payingTx.tx.books?.title ?? ""}" (${payingTx.tx.students?.name ?? ""})?`
+          (clearingIncident
+            ? `Clear the ${formatOrdinal(clearingIncident.incident.offenseNumber)} violation for "${clearingIncident.tx.books?.title ?? ""}" (${clearingIncident.tx.students?.name ?? ""})? This removes it from the student's violation count and lifts any active ban triggered by it.`
             : "")
         }
-        confirmLabel="Confirm Payment"
+        confirmLabel="Clear Violation"
         confirming={busy}
         variant="primary"
       />
@@ -651,15 +715,51 @@ export default function TransactionsPage() {
       >
         {selectedStudent && (
           <div className="space-y-4">
-            <div className="flex items-center gap-3 p-3 rounded-lg bg-slate-50 border border-slate-200">
-              <div className="w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center">
-                <User className="w-5 h-5 text-emerald-700" />
+            <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-slate-50 border border-slate-200">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center">
+                  <User className="w-5 h-5 text-emerald-700" />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">{selectedStudent.name}</p>
+                  <p className="text-xs text-slate-500">Student</p>
+                </div>
               </div>
-              <div>
-                <p className="text-sm font-semibold text-slate-900">{selectedStudent.name}</p>
-                <p className="text-xs text-slate-500">Student</p>
-              </div>
+              <span
+                className={`px-2 py-0.5 rounded text-xs font-semibold ${
+                  selectedStudentViolation?.standingTone === "red"
+                    ? "bg-red-100 text-red-700"
+                    : selectedStudentViolation?.standingTone === "amber"
+                    ? "bg-amber-100 text-amber-800"
+                    : "bg-emerald-100 text-emerald-700"
+                }`}
+              >
+                {selectedStudentViolation?.standingLabel ?? "Good Standing"}
+              </span>
             </div>
+
+            {selectedStudentViolation && selectedStudentViolation.activeViolationCount > 0 && (
+              <div
+                className={`p-3 rounded-lg border text-xs ${
+                  selectedStudentViolation.isBanned
+                    ? "bg-red-50 border-red-200 text-red-800"
+                    : "bg-amber-50 border-amber-200 text-amber-800"
+                }`}
+              >
+                <p className="font-semibold">
+                  Active Violations: {selectedStudentViolation.activeViolationCount}
+                </p>
+                {selectedStudentViolation.isBanned && (
+                  <p className="mt-0.5">
+                    {selectedStudentViolation.blockedByUnreturnedOverdue
+                      ? "Borrowing restricted until overdue book is returned."
+                      : selectedStudentViolation.banEndsAt
+                      ? `Forbidden from borrowing until ${formatDateTime(selectedStudentViolation.banEndsAt)}.`
+                      : "Borrowing currently suspended."}
+                  </p>
+                )}
+              </div>
+            )}
 
             <div className="grid grid-cols-2 gap-3">
               <div className="p-3 rounded-lg bg-slate-50 border border-slate-200">

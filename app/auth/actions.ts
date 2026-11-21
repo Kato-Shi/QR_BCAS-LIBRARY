@@ -1,6 +1,7 @@
 "use server";
 
 import { cookies, headers } from "next/headers";
+import { getRuntimeServerSupabaseConfig } from "@/lib/supabase-env";
 import type { StaffRole } from "@/lib/types";
 
 export interface SessionData {
@@ -19,14 +20,12 @@ async function isHttpsRequest(): Promise<boolean> {
 }
 
 export async function login(staffId: string, password: string) {
-  if (
-    !process.env.NEXT_PUBLIC_SUPABASE_URL ||
-    !process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
-  ) {
+  const { url: supabaseUrl, key: supabaseKey } = getRuntimeServerSupabaseConfig();
+  if (!supabaseUrl || !supabaseKey) {
     return {
       success: false,
       error:
-        "Supabase is not configured. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY.",
+        "Supabase is not configured. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY in your environment variables.",
     };
   }
 

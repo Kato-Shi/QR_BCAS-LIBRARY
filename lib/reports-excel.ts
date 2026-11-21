@@ -6,13 +6,19 @@ import writeXlsxFile, {
 import type {
   BorrowingTransactionWithDetails,
   DashboardStats,
-  FineSetting,
   MostBorrowedBookRow,
   SchoolYearSummary,
+  TopBorrowerStudentRow,
+  ViolationPolicy,
 } from "@/lib/types";
-import type { FineLedgerItem } from "@/lib/supabase/fines";
 import type { WeekBounds, WeeklyCirculationDay } from "@/lib/supabase/dashboard";
-import { computeEffectiveFine } from "@/lib/supabase/transactions";
+import {
+  formatBanDuration,
+  formatOrdinal,
+  formatViolationPolicySummary,
+  type ViolationEvaluationBundle,
+} from "@/lib/supabase/violations";
+import { formatSchoolYearDateRange } from "@/lib/supabase/school-years";
 import { getServerDateString } from "@/lib/server-clock";
 
 // ── Date & Time Formatting ────────────────────────────────────
@@ -56,6 +62,7 @@ export interface CategorizedLoanItem {
   bookAuthor: string;
   accessionNumber: string;
   category: string;
+  studentId: string;
   studentName: string;
   studentNumber: string;
   studentSection: string;
@@ -68,8 +75,10 @@ export interface CategorizedLoanItem {
   daysOverdue: number;
   overdueLabel: string;
   agingBucket: "1–7 Days" | "8–14 Days" | "15+ Days" | "—";
-  fineAmount: number;
-  fineStatus: "Paid" | "Accruing" | "Unpaid" | "No Fine";
+  violationOffense: number;
+  violationLabel: string;
+  violationTone: "emerald" | "amber" | "red" | "muted";
+  violationCleared: boolean;
   wasLate: boolean;
   handledBy: string;
 }
@@ -106,19 +115,19 @@ function formatRemainingLabel(dueDate: Date, now: Date): { days: number; label: 
   return { days, label: `${days} day${days === 1 ? "" : "s"} left` };
 }
 
-function formatOverdueLabel(dueDate: Date, endDate: Date, daysOverdue: number): string {
-  if (daysOverdue >= 1) {
-    return `${daysOverdue} day${daysOverdue === 1 ? "" : "s"}`;
-  }
+function formatOverdueLabel(dueDate: Date, endDate: Date): { days: number; label: string } {
   const diffMs = Math.max(0, endDate.getTime() - dueDate.getTime());
+  const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+  if (days >= 1) {
+    return { days, label: `${days} day${days === 1 ? "" : "s"}` };
+  }
   const hours = Math.max(1, Math.floor(diffMs / (1000 * 60 * 60)));
-  return `${hours} hr${hours === 1 ? "" : "s"}`;
+  return { days: 0, label: `${hours} hr${hours === 1 ? "" : "s"}` };
 }
 
 export function categorizeTransactions(
   transactions: BorrowingTransactionWithDetails[],
-  fineRate: number,
-  maxFine: number,
+  violationBundle: ViolationEvaluationBundle,
   referenceNow: Date
 ): CategorizedTransactionsResult {
   const borrowedOnTime: CategorizedLoanItem[] = [];
@@ -134,7 +143,7 @@ export function categorizeTransactions(
     const isReturned = tx.status === "Returned" || Boolean(tx.date_returned);
     const isOverdue = !isReturned && (tx.status === "Overdue" || due.getTime() < referenceNow.getTime());
 
-    const fineCalc = computeEffectiveFine(tx, fineRate, maxFine, referenceNow);
+    const incident = violationBundle.byTransactionId.get(tx.id);
     const handledBy = tx.handled_by_name
       ? tx.handled_by_role
         ? `${tx.handled_by_name} (${tx.handled_by_role})`
@@ -153,63 +162,75 @@ export function categorizeTransactions(
     const catRow = categoryMap.get(category)!;
     catRow.totalLoans += 1;
 
+    let violationLabel = "None";
+    let violationTone: CategorizedLoanItem["violationTone"] = "muted";
+    let violationOffense = 0;
+    let violationCleared = false;
+
+    if (incident) {
+      violationCleared = incident.cleared;
+      if (incident.cleared) {
+        violationLabel = "Cleared / Excused";
+        violationTone = "emerald";
+      } else {
+        violationOffense = incident.offenseNumber;
+        const rule = incident.ruleApplied;
+        const isBan = rule?.action === "ban" && (rule.banDays ?? 0) > 0;
+        violationLabel = isBan
+          ? `${formatOrdinal(incident.offenseNumber)} — ${formatBanDuration(rule!.banDays)} Ban`
+          : `${formatOrdinal(incident.offenseNumber)} — ${rule?.label ?? "Warning"}`;
+        violationTone = isBan ? "red" : "amber";
+      }
+    }
+
     const baseItem = {
       id: tx.id,
       bookTitle: book?.title ?? "Unknown Book",
       bookAuthor: book?.author ?? "—",
       accessionNumber: book?.accession_number ?? "—",
       category,
+      studentId: tx.student_id,
       studentName: student?.name ?? "Unknown Student",
       studentNumber: student?.student_number ?? "—",
       studentSection: student?.section ?? "—",
       dateBorrowed: tx.date_borrowed,
       dueDate: tx.due_date,
       dateReturned: tx.date_returned,
+      violationOffense,
+      violationLabel,
+      violationTone,
+      violationCleared,
       handledBy,
     };
 
     if (isReturned) {
       catRow.returned += 1;
       const returnDate = tx.date_returned ? new Date(tx.date_returned) : referenceNow;
-      const wasLate = returnDate.getTime() > due.getTime() || fineCalc.amount > 0;
-      const fineStatus: CategorizedLoanItem["fineStatus"] =
-        fineCalc.amount <= 0 ? "No Fine" : tx.fine_paid ? "Paid" : "Unpaid";
+      const wasLate = returnDate.getTime() > due.getTime();
+      const span = wasLate ? formatOverdueLabel(due, returnDate) : { days: 0, label: "On time" };
 
       returnedItems.push({
         ...baseItem,
         status: "Returned",
         daysRemaining: 0,
         remainingLabel: "—",
-        daysOverdue: fineCalc.daysOverdue,
-        overdueLabel: wasLate
-          ? formatOverdueLabel(due, returnDate, fineCalc.daysOverdue)
-          : "On time",
+        daysOverdue: span.days,
+        overdueLabel: span.label,
         agingBucket: "—",
-        fineAmount: fineCalc.amount,
-        fineStatus,
         wasLate,
       });
     } else if (isOverdue) {
       catRow.overdue += 1;
-      const fineStatus: CategorizedLoanItem["fineStatus"] =
-        fineCalc.amount <= 0
-          ? "No Fine"
-          : tx.fine_paid
-          ? "Paid"
-          : fineCalc.isAccruing
-          ? "Accruing"
-          : "Unpaid";
+      const span = formatOverdueLabel(due, referenceNow);
 
       overdueItems.push({
         ...baseItem,
         status: "Overdue",
         daysRemaining: 0,
         remainingLabel: "Past due",
-        daysOverdue: fineCalc.daysOverdue,
-        overdueLabel: formatOverdueLabel(due, referenceNow, fineCalc.daysOverdue),
-        agingBucket: getAgingBucket(fineCalc.daysOverdue),
-        fineAmount: fineCalc.amount,
-        fineStatus,
+        daysOverdue: span.days,
+        overdueLabel: span.label,
+        agingBucket: getAgingBucket(span.days),
         wasLate: true,
       });
     } else {
@@ -223,17 +244,11 @@ export function categorizeTransactions(
         daysOverdue: 0,
         overdueLabel: "—",
         agingBucket: "—",
-        fineAmount: 0,
-        fineStatus: "No Fine",
         wasLate: false,
       });
     }
   }
 
-  // Sort for operational clarity:
-  // - Borrowed On Time: soonest due date first
-  // - Overdue: most overdue first
-  // - Returned: most recently returned first
   borrowedOnTime.sort((a, b) => new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime());
   overdueItems.sort((a, b) => new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime());
   returnedItems.sort(
@@ -259,15 +274,15 @@ export function categorizeTransactions(
 export interface FullLibraryReportInput {
   generatedAt: Date;
   preparedBy: string;
+  schoolYearScopeLabel?: string;
   weekBounds: WeekBounds;
   weekPresetLabel: string;
   stats: DashboardStats | null;
-  fineSettings: Pick<FineSetting, "fine_rate_per_day" | "max_fine">;
+  violationPolicy: ViolationPolicy;
+  violationBundle: ViolationEvaluationBundle;
   weeklyCirculation: WeeklyCirculationDay[];
   categorized: CategorizedTransactionsResult;
-  finesLedger: FineLedgerItem[];
-  pendingFines: number;
-  paidFines: number;
+  topBorrowers: TopBorrowerStudentRow[];
   mostBorrowed: MostBorrowedBookRow[];
   schoolYearSummaries: SchoolYearSummary[];
 }
@@ -305,27 +320,20 @@ function cell(
   return { text: String(text), align, tone };
 }
 
-function php(amount: number): string {
-  return `₱${amount.toLocaleString("en-PH", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
-
 export function buildFullReportPreviewSheets(
   input: FullLibraryReportInput
 ): ExcelPreviewSheet[] {
   const {
     generatedAt,
     preparedBy,
+    schoolYearScopeLabel,
     weekBounds,
     weekPresetLabel,
-    fineSettings,
+    violationPolicy,
+    violationBundle,
     weeklyCirculation,
     categorized,
-    finesLedger,
-    pendingFines,
-    paidFines,
+    topBorrowers,
     mostBorrowed,
     schoolYearSummaries,
   } = input;
@@ -339,6 +347,9 @@ export function buildFullReportPreviewSheets(
   const aging1to7 = categorized.overdueItems.filter((i) => i.agingBucket === "1–7 Days").length;
   const aging8to14 = categorized.overdueItems.filter((i) => i.agingBucket === "8–14 Days").length;
   const aging15plus = categorized.overdueItems.filter((i) => i.agingBucket === "15+ Days").length;
+
+  const policySummary = formatViolationPolicySummary(violationPolicy);
+  const topStudent = topBorrowers[0];
 
   // 1. Executive Summary
   const summaryRows: ExcelPreviewRow[] = [
@@ -354,7 +365,7 @@ export function buildFullReportPreviewSheets(
       cells: [
         cell("Institution"),
         cell("Batangas College of Arts and Sciences — Library", "left", "bold"),
-        cell("Official Circulation & Analytics Workbook", "left", "muted"),
+        cell("Official Circulation, Violations & Analytics Workbook", "left", "muted"),
       ],
     },
     {
@@ -373,21 +384,24 @@ export function buildFullReportPreviewSheets(
     },
     {
       cells: [
+        cell("School Year Scope"),
+        cell(schoolYearScopeLabel || "All School Years", "left", "bold"),
+        cell("Scope applied to KPIs, violations, borrowers & transactions", "left", "muted"),
+      ],
+    },
+    {
+      cells: [
         cell("Prepared By"),
         cell(preparedBy, "left", "bold"),
-        cell(
-          `Fine Rate: ${php(fineSettings.fine_rate_per_day)}/day • Max: ${php(fineSettings.max_fine)}`,
-          "left",
-          "muted"
-        ),
+        cell(`Violation Policy: ${policySummary}`, "left", "muted"),
       ],
     },
     {
       isSectionHeader: true,
       cells: [
         cell("Library Operations KPI", "left", "bold"),
-        cell("Count / Amount", "right", "bold"),
-        cell("Category Status", "left", "bold"),
+        cell("Count / Highlight", "right", "bold"),
+        cell("Details & Status", "left", "bold"),
       ],
     },
     {
@@ -431,16 +445,34 @@ export function buildFullReportPreviewSheets(
     },
     {
       cells: [
-        cell("Pending / Accruing Fines"),
-        cell(php(pendingFines), "right", pendingFines > 0 ? "amber" : "emerald"),
-        cell("Unpaid + live overdue fines", "left", "muted"),
+        cell("Active Student Violations"),
+        cell(
+          violationBundle.totalActiveViolations,
+          "right",
+          violationBundle.totalActiveViolations > 0 ? "amber" : "emerald"
+        ),
+        cell(
+          `Restricted/Banned: ${violationBundle.bannedStudentCount} • Warned: ${violationBundle.warnedStudentCount}`,
+          "left",
+          violationBundle.bannedStudentCount > 0 ? "red" : "muted"
+        ),
       ],
     },
     {
       cells: [
-        cell("Collected Fines"),
-        cell(php(paidFines), "right", "emerald"),
-        cell(`Combined total: ${php(pendingFines + paidFines)}`, "left", "muted"),
+        cell("Top Borrowing Student (#1)"),
+        cell(
+          topStudent ? `${topStudent.totalBorrowed} books` : "—",
+          "right",
+          "emerald"
+        ),
+        cell(
+          topStudent
+            ? `${topStudent.studentName} (${topStudent.studentSection}) — ${topStudent.standingLabel}`
+            : "No borrowing history yet",
+          "left",
+          "bold"
+        ),
       ],
     },
     {
@@ -522,46 +554,21 @@ export function buildFullReportPreviewSheets(
   }));
 
   // 4. Overdue Items
-  const overdueFineSum = categorized.overdueItems.reduce((s, i) => s + i.fineAmount, 0);
-  const overdueRows: ExcelPreviewRow[] = [
-    ...categorized.overdueItems.map((item) => ({
-      cells: [
-        cell(item.bookTitle, "left", "bold"),
-        cell(item.accessionNumber),
-        cell(item.category),
-        cell(item.studentName, "left", "bold"),
-        cell(item.studentNumber),
-        cell(item.studentSection),
-        cell(formatDateTime(item.dateBorrowed)),
-        cell(formatDateTime(item.dueDate), "left", "red"),
-        cell(item.overdueLabel, "center", "red"),
-        cell(item.agingBucket, "center", item.agingBucket === "15+ Days" ? "red" : "amber"),
-        cell(php(item.fineAmount), "right", "amber"),
-        cell(item.fineStatus, "center", item.fineStatus === "Paid" ? "emerald" : "amber"),
-      ],
-    })),
-    ...(categorized.overdueItems.length > 0
-      ? [
-          {
-            isTotal: true,
-            cells: [
-              cell(`TOTAL OVERDUE ITEMS: ${categorized.overdueItems.length}`, "left", "bold"),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell("TOTAL FINES", "center", "bold"),
-              cell(php(overdueFineSum), "right", "red"),
-              cell(""),
-            ],
-          },
-        ]
-      : []),
-  ];
+  const overdueRows: ExcelPreviewRow[] = categorized.overdueItems.map((item) => ({
+    cells: [
+      cell(item.bookTitle, "left", "bold"),
+      cell(item.accessionNumber),
+      cell(item.category),
+      cell(item.studentName, "left", "bold"),
+      cell(item.studentNumber),
+      cell(item.studentSection),
+      cell(formatDateTime(item.dateBorrowed)),
+      cell(formatDateTime(item.dueDate), "left", "red"),
+      cell(item.overdueLabel, "center", "red"),
+      cell(item.agingBucket, "center", item.agingBucket === "15+ Days" ? "red" : "amber"),
+      cell(item.violationLabel, "center", item.violationTone),
+    ],
+  }));
 
   // 5. Returned Items
   const returnedRows: ExcelPreviewRow[] = categorized.returnedItems.map((item) => ({
@@ -575,57 +582,52 @@ export function buildFullReportPreviewSheets(
       cell(formatDateTime(item.dueDate)),
       cell(formatDateTime(item.dateReturned), "left", "blue"),
       cell(item.wasLate ? `Late (${item.overdueLabel})` : "On Time", "center", item.wasLate ? "amber" : "emerald"),
-      cell(php(item.fineAmount), "right", item.fineAmount > 0 ? "amber" : "muted"),
-      cell(item.fineStatus, "center", item.fineStatus === "Paid" ? "emerald" : item.fineStatus === "Unpaid" ? "red" : "muted"),
+      cell(item.violationLabel, "center", item.violationTone),
     ],
   }));
 
-  // 6. Fines Ledger
-  const finesRows: ExcelPreviewRow[] = [
-    ...finesLedger.map((f) => ({
-      cells: [
-        cell(f.student_name, "left", "bold"),
-        cell(f.student_number || "—"),
-        cell(f.student_section || "—"),
-        cell(f.book_title, "left", "bold"),
-        cell(f.accession_number || "—"),
-        cell(f.status, "center"),
-        cell(formatDateTime(f.date_borrowed)),
-        cell(formatDateTime(f.due_date)),
-        cell(formatDateTime(f.date_returned)),
-        cell(`${f.days_overdue}d`, "right"),
-        cell(php(f.fine_amount), "right", "bold"),
-        cell(
-          f.fine_paid ? "Paid" : f.is_accruing ? "Accruing" : "Unpaid",
-          "center",
-          f.fine_paid ? "emerald" : f.is_accruing ? "amber" : "red"
-        ),
-      ],
-    })),
-    ...(finesLedger.length > 0
-      ? [
-          {
-            isTotal: true,
-            cells: [
-              cell("TOTALS", "left", "bold"),
-              cell(`Pending: ${php(pendingFines)}`, "left", "amber"),
-              cell(`Collected: ${php(paidFines)}`, "left", "emerald"),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell(""),
-              cell("COMBINED", "right", "bold"),
-              cell(php(pendingFines + paidFines), "right", "bold"),
-              cell(`${finesLedger.length} records`, "center", "muted"),
-            ],
-          },
-        ]
-      : []),
-  ];
+  // 6. Student Violations
+  const violationRows: ExcelPreviewRow[] = violationBundle.studentsWithViolations.map((st) => ({
+    cells: [
+      cell(st.studentName, "left", "bold"),
+      cell(st.studentNumber),
+      cell(st.studentSection),
+      cell(st.activeViolationCount, "right", st.activeViolationCount > 0 ? "red" : "muted"),
+      cell(st.clearedViolationCount, "right", st.clearedViolationCount > 0 ? "emerald" : "muted"),
+      cell(st.standingLabel, "left", st.standingTone),
+      cell(
+        st.isBanned
+          ? st.blockedByUnreturnedOverdue
+            ? "Return overdue book first"
+            : st.banEndsAt
+            ? `${formatDateTime(st.banEndsAt)} (${st.banRemainingLabel})`
+            : "Restricted"
+          : "Allowed to borrow",
+        "left",
+        st.isBanned ? "red" : "emerald"
+      ),
+      cell(formatDateTime(st.latestViolationAt)),
+    ],
+  }));
 
-  // 7. Popular Books
+  // 7. Top Borrowers (Students)
+  const topBorrowerRows: ExcelPreviewRow[] = topBorrowers.map((tb) => ({
+    cells: [
+      cell(`#${tb.rank}`, "center", "bold"),
+      cell(tb.studentName, "left", "bold"),
+      cell(tb.studentNumber),
+      cell(tb.studentSection),
+      cell([tb.gradeLevel, tb.program].filter(Boolean).join(" • ") || "—"),
+      cell(tb.totalBorrowed, "right", "emerald"),
+      cell(tb.currentlyBorrowed, "right", tb.currentlyBorrowed > 0 ? "blue" : "muted"),
+      cell(tb.returnedOnTime, "right", "default"),
+      cell(tb.activeViolations, "right", tb.activeViolations > 0 ? "red" : "muted"),
+      cell(tb.standingLabel, "center", tb.standingTone),
+      cell(formatDateTime(tb.lastBorrowedAt)),
+    ],
+  }));
+
+  // 8. Popular Books
   const popularRows: ExcelPreviewRow[] = mostBorrowed.map((b, idx) => ({
     cells: [
       cell(`#${idx + 1}`, "center", "bold"),
@@ -637,16 +639,31 @@ export function buildFullReportPreviewSheets(
     ],
   }));
 
-  // 8. School Year Summary
+  // 9. School Year Summary
   const syRows: ExcelPreviewRow[] = schoolYearSummaries.map((sy) => ({
     cells: [
-      cell(sy.school_year_name, "left", "bold"),
+      cell(
+        `${sy.school_year_name}${sy.is_active ? " (Active)" : ""}`,
+        "left",
+        sy.is_active ? "emerald" : "bold"
+      ),
+      cell(
+        sy.start_date && sy.end_date
+          ? formatSchoolYearDateRange(sy.start_date, sy.end_date)
+          : "—",
+        "left",
+        "muted"
+      ),
       cell(sy.total_transactions, "right", "bold"),
+      cell(sy.unique_students ?? 0, "right"),
       cell(sy.currently_borrowed, "right", "emerald"),
       cell(sy.returned, "right", "blue"),
       cell(sy.overdue, "right", sy.overdue > 0 ? "red" : "muted"),
-      cell(php(Number(sy.total_fines ?? 0)), "right", "amber"),
-      cell(php(Number(sy.fines_collected ?? 0)), "right", "emerald"),
+      cell(
+        sy.violations_count ?? 0,
+        "right",
+        (sy.violations_count ?? 0) > 0 ? "amber" : "muted"
+      ),
     ],
   }));
 
@@ -654,7 +671,7 @@ export function buildFullReportPreviewSheets(
     {
       id: "summary",
       name: "Executive Summary",
-      description: "Library KPIs, report metadata, overdue aging, and circulation by category.",
+      description: "Library KPIs, violation policy summary, top borrowing student, and circulation by category.",
       badgeTone: "emerald",
       headers: [
         { label: "Metric / Category" },
@@ -708,7 +725,7 @@ export function buildFullReportPreviewSheets(
     {
       id: "overdue",
       name: "Overdue Items",
-      description: "Unreturned items past their due date & time, with live accruing fines.",
+      description: "Unreturned items past their due date & time, with student violation escalation status.",
       countBadge: String(totalOverdueCount),
       badgeTone: totalOverdueCount > 0 ? "red" : "slate",
       headers: [
@@ -722,14 +739,13 @@ export function buildFullReportPreviewSheets(
         { label: "Due Date & Time" },
         { label: "Overdue By", align: "center" },
         { label: "Aging Bucket", align: "center" },
-        { label: "Accruing Fine", align: "right" },
-        { label: "Fine Status", align: "center" },
+        { label: "Violation Penalty", align: "center" },
       ],
       rows: overdueRows,
       summaryNote:
         totalOverdueCount === 0
           ? "All clear — no overdue books right now."
-          : `${totalOverdueCount} overdue item${totalOverdueCount === 1 ? "" : "s"} totaling ${php(overdueFineSum)}.`,
+          : `${totalOverdueCount} overdue item${totalOverdueCount === 1 ? "" : "s"} requiring follow-up.`,
     },
     {
       id: "returned",
@@ -747,32 +763,51 @@ export function buildFullReportPreviewSheets(
         { label: "Due Date & Time" },
         { label: "Returned Date & Time" },
         { label: "Return Timing", align: "center" },
-        { label: "Fine", align: "right" },
-        { label: "Fine Status", align: "center" },
+        { label: "Violation Status", align: "center" },
       ],
       rows: returnedRows,
     },
     {
-      id: "fines",
-      name: "Fines Ledger",
-      description: "All recorded and live accruing fines with exact transaction timestamps.",
-      countBadge: String(finesLedger.length),
-      badgeTone: pendingFines > 0 ? "amber" : "slate",
+      id: "violations",
+      name: "Student Violations",
+      description: `Student violation counts, active warnings, and borrowing bans (${policySummary}).`,
+      countBadge: String(violationBundle.totalActiveViolations),
+      badgeTone: violationBundle.bannedStudentCount > 0 ? "red" : violationBundle.totalActiveViolations > 0 ? "amber" : "slate",
       headers: [
         { label: "Student" },
         { label: "Student #" },
         { label: "Section" },
-        { label: "Book Title" },
-        { label: "Accession #" },
-        { label: "Loan Status", align: "center" },
-        { label: "Borrowed Date & Time" },
-        { label: "Due Date & Time" },
-        { label: "Returned Date & Time" },
-        { label: "Days Late", align: "right" },
-        { label: "Fine Amount", align: "right" },
-        { label: "Payment", align: "center" },
+        { label: "Active Violations", align: "right" },
+        { label: "Cleared", align: "right" },
+        { label: "Current Standing / Penalty" },
+        { label: "Borrowing Access / Restriction" },
+        { label: "Latest Violation Date & Time" },
       ],
-      rows: finesRows,
+      rows: violationRows,
+    },
+    {
+      id: "top-borrowers",
+      name: "Top Borrowers",
+      description: "Ranked students with the highest number of borrowed books.",
+      countBadge: String(topBorrowers.length),
+      badgeTone: "emerald",
+      headers: [
+        { label: "Rank", align: "center" },
+        { label: "Student Name" },
+        { label: "Student #" },
+        { label: "Section" },
+        { label: "Grade / Program" },
+        { label: "Total Borrowed", align: "right" },
+        { label: "Currently Out", align: "right" },
+        { label: "Returned On Time", align: "right" },
+        { label: "Violations", align: "right" },
+        { label: "Standing", align: "center" },
+        { label: "Last Borrowed Date & Time" },
+      ],
+      rows: topBorrowerRows,
+      summaryNote: topStudent
+        ? `#1 Most Borrowed: ${topStudent.studentName} (${topStudent.totalBorrowed} books)`
+        : undefined,
     },
     {
       id: "popular",
@@ -793,17 +828,18 @@ export function buildFullReportPreviewSheets(
     {
       id: "school-years",
       name: "School Year Summary",
-      description: "Academic-year totals for transactions, returns, overdue counts, and fines.",
+      description: "Academic-year totals for transactions, unique students, active loans, returns, overdue items, and violations.",
       countBadge: String(schoolYearSummaries.length),
       badgeTone: "slate",
       headers: [
         { label: "School Year" },
-        { label: "Total Transactions", align: "right" },
-        { label: "Currently Borrowed", align: "right" },
+        { label: "Academic Period" },
+        { label: "Total Loans", align: "right" },
+        { label: "Unique Students", align: "right" },
+        { label: "Borrowed (On Time)", align: "right" },
         { label: "Returned", align: "right" },
         { label: "Overdue", align: "right" },
-        { label: "Total Fines", align: "right" },
-        { label: "Fines Collected", align: "right" },
+        { label: "Active Violations", align: "right" },
       ],
       rows: syRows,
     },
@@ -813,7 +849,6 @@ export function buildFullReportPreviewSheets(
 // ── Real .xlsx Excel Workbook Generator ───────────────────────
 
 const BORDER_LIGHT = "#CBD5E1";
-const CURRENCY_FORMAT = '"₱"#,##0.00';
 const INT_FORMAT = "#,##0";
 
 function bannerRow(title: string, colCount: number, bg = "#065F46"): Row {
@@ -892,10 +927,7 @@ function tableHeaderRow(
   }));
 }
 
-function strCell(
-  value: string,
-  opts?: Partial<CellObject>
-): CellObject {
+function strCell(value: string, opts?: Partial<CellObject>): CellObject {
   return {
     value,
     type: String,
@@ -906,30 +938,11 @@ function strCell(
   };
 }
 
-function numCell(
-  value: number,
-  opts?: Partial<CellObject>
-): CellObject {
+function numCell(value: number, opts?: Partial<CellObject>): CellObject {
   return {
     value,
     type: Number,
     format: INT_FORMAT,
-    align: "right",
-    borderColor: BORDER_LIGHT,
-    borderStyle: "thin",
-    alignVertical: "center",
-    ...opts,
-  };
-}
-
-function moneyCell(
-  value: number,
-  opts?: Partial<CellObject>
-): CellObject {
-  return {
-    value,
-    type: Number,
-    format: CURRENCY_FORMAT,
     align: "right",
     borderColor: BORDER_LIGHT,
     borderStyle: "thin",
@@ -964,20 +977,22 @@ export async function exportFullLibraryExcel(
   const {
     generatedAt,
     preparedBy,
+    schoolYearScopeLabel,
     weekBounds,
     weekPresetLabel,
-    fineSettings,
+    violationPolicy,
+    violationBundle,
     weeklyCirculation,
     categorized,
-    finesLedger,
-    pendingFines,
-    paidFines,
+    topBorrowers,
     mostBorrowed,
     schoolYearSummaries,
   } = input;
 
   const generatedStamp = formatDateTime(generatedAt.toISOString());
-  const metaLine = `Generated: ${generatedStamp}  |  Week Filter: ${weekPresetLabel} (${weekBounds.rangeLabel})  |  Prepared by: ${preparedBy}  |  Fine Policy: ₱${fineSettings.fine_rate_per_day.toFixed(2)}/day (Max ₱${fineSettings.max_fine.toFixed(2)})`;
+  const policySummary = formatViolationPolicySummary(violationPolicy);
+  const syScope = schoolYearScopeLabel || "All School Years";
+  const metaLine = `Generated: ${generatedStamp}  |  School Year: ${syScope}  |  Week Filter: ${weekPresetLabel} (${weekBounds.rangeLabel})  |  Prepared by: ${preparedBy}  |  Violation Policy: ${policySummary}`;
 
   const totalBorrowedOnTime = categorized.borrowedOnTime.length;
   const totalOverdue = categorized.overdueItems.length;
@@ -985,10 +1000,11 @@ export async function exportFullLibraryExcel(
   const aging1to7 = categorized.overdueItems.filter((i) => i.agingBucket === "1–7 Days").length;
   const aging8to14 = categorized.overdueItems.filter((i) => i.agingBucket === "8–14 Days").length;
   const aging15plus = categorized.overdueItems.filter((i) => i.agingBucket === "15+ Days").length;
+  const topStudent = topBorrowers[0];
 
   // ── Sheet 1: Executive Summary ──
   const summaryData: Row[] = [
-    bannerRow("BCAS LIBRARY — COMPLETE OPERATIONS & ANALYTICS REPORT", 5),
+    bannerRow("BCAS LIBRARY — COMPLETE OPERATIONS, VIOLATIONS & ANALYTICS REPORT", 5),
     subtitleRow(metaLine, 5),
     [],
     sectionHeaderRow("1. KEY PERFORMANCE INDICATORS", 5),
@@ -1019,37 +1035,44 @@ export async function exportFullLibraryExcel(
       }),
     ],
     [
-      strCell("Total Active Checkouts (On Time + Overdue)", { fontWeight: "bold" }),
-      numCell(totalBorrowedOnTime + totalOverdue, { fontWeight: "bold" }),
-      strCell("All items currently in student possession"),
-      strCell("Circulation"),
-      strCell("Active", { align: "center", backgroundColor: "#F1F5F9", textColor: "#334155" }),
-    ],
-    [
-      strCell("Returned Transactions", { fontWeight: "bold" }),
+      strCell("Total Returned", { fontWeight: "bold" }),
       numCell(totalReturned, { fontWeight: "bold", textColor: "#1D4ED8" }),
       strCell("All completed book returns"),
       strCell("Circulation"),
       strCell("Completed", { align: "center", backgroundColor: "#EFF6FF", textColor: "#1D4ED8" }),
     ],
     [
-      strCell("Pending / Accruing Fines", { fontWeight: "bold" }),
-      moneyCell(pendingFines, { fontWeight: "bold", textColor: pendingFines > 0 ? "#B45309" : "#047857" }),
-      strCell("Unpaid finalized fines + live accruing overdue fines"),
-      strCell("Fines"),
-      strCell(pendingFines > 0 ? "Unsettled" : "Settled", {
+      strCell("Active Student Violations", { fontWeight: "bold" }),
+      numCell(violationBundle.totalActiveViolations, {
+        fontWeight: "bold",
+        textColor: violationBundle.totalActiveViolations > 0 ? "#B45309" : "#047857",
+      }),
+      strCell(
+        `Restricted/Banned: ${violationBundle.bannedStudentCount}  |  Warned: ${violationBundle.warnedStudentCount}  |  Policy: ${policySummary}`
+      ),
+      strCell("Violations"),
+      strCell(violationBundle.bannedStudentCount > 0 ? "Restrictions Active" : "Monitoring", {
         align: "center",
-        backgroundColor: pendingFines > 0 ? "#FFFBEB" : "#ECFDF5",
-        textColor: pendingFines > 0 ? "#B45309" : "#047857",
+        backgroundColor: violationBundle.bannedStudentCount > 0 ? "#FEF2F2" : "#ECFDF5",
+        textColor: violationBundle.bannedStudentCount > 0 ? "#B91C1C" : "#047857",
         fontWeight: "bold",
       }),
     ],
     [
-      strCell("Collected Fines", { fontWeight: "bold" }),
-      moneyCell(paidFines, { fontWeight: "bold", textColor: "#047857" }),
-      strCell(`Combined Total Fines: ₱${(pendingFines + paidFines).toFixed(2)}`),
-      strCell("Fines"),
-      strCell("Collected", { align: "center", backgroundColor: "#ECFDF5", textColor: "#047857", fontWeight: "bold" }),
+      strCell("Top Borrowing Student (#1)", { fontWeight: "bold" }),
+      numCell(topStudent?.totalBorrowed ?? 0, { fontWeight: "bold", textColor: "#047857" }),
+      strCell(
+        topStudent
+          ? `${topStudent.studentName} (${topStudent.studentSection}) — ${topStudent.standingLabel}`
+          : "No borrowing records yet"
+      ),
+      strCell("Top Readers"),
+      strCell(topStudent ? "Top Reader" : "—", {
+        align: "center",
+        backgroundColor: "#ECFDF5",
+        textColor: "#047857",
+        fontWeight: "bold",
+      }),
     ],
     [],
     sectionHeaderRow("2. CIRCULATION BY CLASSIFICATION / CATEGORY", 5),
@@ -1157,10 +1180,9 @@ export async function exportFullLibraryExcel(
   ];
 
   // ── Sheet 4: Overdue Items ──
-  const overdueFineTotal = categorized.overdueItems.reduce((s, i) => s + i.fineAmount, 0);
   const overdueData: Row[] = [
-    bannerRow(`OVERDUE ITEMS (${totalOverdue} ITEMS)`, 13, "#991B1B"),
-    subtitleRow(metaLine, 13),
+    bannerRow(`OVERDUE ITEMS (${totalOverdue} ITEMS)`, 12, "#991B1B"),
+    subtitleRow(metaLine, 12),
     tableHeaderRow(
       [
         { label: "Book Title" },
@@ -1174,59 +1196,40 @@ export async function exportFullLibraryExcel(
         { label: "Due Date & Time" },
         { label: "Overdue Duration", align: "center" },
         { label: "Aging Bucket", align: "center" },
-        { label: "Accruing Fine (PHP)", align: "right" },
-        { label: "Fine Status", align: "center" },
+        { label: "Violation Penalty", align: "center" },
       ],
       "#B91C1C"
     ),
     ...(categorized.overdueItems.length > 0
-      ? [
-          ...categorized.overdueItems.map((item, i) => {
-            const bg = i % 2 === 1 ? "#FEF2F2" : undefined;
-            return [
-              strCell(item.bookTitle, { fontWeight: "bold", backgroundColor: bg }),
-              strCell(item.bookAuthor, { backgroundColor: bg }),
-              strCell(item.accessionNumber, { backgroundColor: bg }),
-              strCell(item.category, { backgroundColor: bg }),
-              strCell(item.studentName, { fontWeight: "bold", backgroundColor: bg }),
-              strCell(item.studentNumber, { backgroundColor: bg }),
-              strCell(item.studentSection, { backgroundColor: bg }),
-              strCell(formatDateTime(item.dateBorrowed), { backgroundColor: bg }),
-              strCell(formatDateTime(item.dueDate), { textColor: "#B91C1C", fontWeight: "bold", backgroundColor: bg }),
-              strCell(item.overdueLabel, { align: "center", textColor: "#B91C1C", fontWeight: "bold", backgroundColor: bg }),
-              strCell(item.agingBucket, { align: "center", backgroundColor: bg }),
-              moneyCell(item.fineAmount, { fontWeight: "bold", textColor: "#B45309", backgroundColor: bg }),
-              strCell(item.fineStatus, {
-                align: "center",
-                fontWeight: "bold",
-                backgroundColor: item.fineStatus === "Paid" ? "#ECFDF5" : "#FFFBEB",
-                textColor: item.fineStatus === "Paid" ? "#047857" : "#B45309",
-              }),
-            ];
-          }),
-          [
-            strCell(`TOTAL OVERDUE: ${totalOverdue} ITEMS`, { fontWeight: "bold", backgroundColor: "#FEE2E2", textColor: "#991B1B" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-            strCell("TOTAL FINES", { align: "center", fontWeight: "bold", backgroundColor: "#FEE2E2", textColor: "#991B1B" }),
-            moneyCell(overdueFineTotal, { fontWeight: "bold", backgroundColor: "#FEE2E2", textColor: "#991B1B" }),
-            strCell("", { backgroundColor: "#FEE2E2" }),
-          ],
-        ]
-      : [emptyNoticeRow("No overdue items — all active loans are within their due dates.", 13)]),
+      ? categorized.overdueItems.map((item, i) => {
+          const bg = i % 2 === 1 ? "#FEF2F2" : undefined;
+          return [
+            strCell(item.bookTitle, { fontWeight: "bold", backgroundColor: bg }),
+            strCell(item.bookAuthor, { backgroundColor: bg }),
+            strCell(item.accessionNumber, { backgroundColor: bg }),
+            strCell(item.category, { backgroundColor: bg }),
+            strCell(item.studentName, { fontWeight: "bold", backgroundColor: bg }),
+            strCell(item.studentNumber, { backgroundColor: bg }),
+            strCell(item.studentSection, { backgroundColor: bg }),
+            strCell(formatDateTime(item.dateBorrowed), { backgroundColor: bg }),
+            strCell(formatDateTime(item.dueDate), { textColor: "#B91C1C", fontWeight: "bold", backgroundColor: bg }),
+            strCell(item.overdueLabel, { align: "center", textColor: "#B91C1C", fontWeight: "bold", backgroundColor: bg }),
+            strCell(item.agingBucket, { align: "center", backgroundColor: bg }),
+            strCell(item.violationLabel, {
+              align: "center",
+              fontWeight: "bold",
+              backgroundColor: item.violationTone === "red" ? "#FEE2E2" : item.violationTone === "amber" ? "#FEF3C7" : "#ECFDF5",
+              textColor: item.violationTone === "red" ? "#991B1B" : item.violationTone === "amber" ? "#92400E" : "#047857",
+            }),
+          ];
+        })
+      : [emptyNoticeRow("No overdue items — all active loans are within their due dates.", 12)]),
   ];
 
   // ── Sheet 5: Returned Items ──
   const returnedData: Row[] = [
-    bannerRow(`RETURNED ITEMS HISTORY (${totalReturned} ITEMS)`, 12, "#1E3A8A"),
-    subtitleRow(metaLine, 12),
+    bannerRow(`RETURNED ITEMS HISTORY (${totalReturned} ITEMS)`, 11, "#1E3A8A"),
+    subtitleRow(metaLine, 11),
     tableHeaderRow(
       [
         { label: "Book Title" },
@@ -1239,8 +1242,7 @@ export async function exportFullLibraryExcel(
         { label: "Due Date & Time" },
         { label: "Returned Date & Time" },
         { label: "Return Timing", align: "center" },
-        { label: "Fine (PHP)", align: "right" },
-        { label: "Fine Status", align: "center" },
+        { label: "Violation Status", align: "center" },
       ],
       "#1D4ED8"
     ),
@@ -1263,78 +1265,109 @@ export async function exportFullLibraryExcel(
               backgroundColor: item.wasLate ? "#FFFBEB" : "#ECFDF5",
               fontWeight: "bold",
             }),
-            moneyCell(item.fineAmount, { backgroundColor: bg }),
-            strCell(item.fineStatus, { align: "center", backgroundColor: bg }),
+            strCell(item.violationLabel, { align: "center", backgroundColor: bg }),
           ];
         })
-      : [emptyNoticeRow("No returned transactions recorded yet.", 12)]),
+      : [emptyNoticeRow("No returned transactions recorded yet.", 11)]),
   ];
 
-  // ── Sheet 6: Fines Ledger ──
-  const finesData: Row[] = [
-    bannerRow(`FINES LEDGER (${finesLedger.length} RECORDS)`, 12, "#92400E"),
-    subtitleRow(metaLine, 12),
+  // ── Sheet 6: Student Violations ──
+  const violationsData: Row[] = [
+    bannerRow(`STUDENT VIOLATIONS LOG (${violationBundle.totalActiveViolations} ACTIVE VIOLATIONS)`, 8, "#92400E"),
+    subtitleRow(metaLine, 8),
     tableHeaderRow(
       [
         { label: "Student Name" },
         { label: "Student #" },
         { label: "Section" },
-        { label: "Book Title" },
-        { label: "Accession #" },
-        { label: "Loan Status", align: "center" },
-        { label: "Borrowed Date & Time" },
-        { label: "Due Date & Time" },
-        { label: "Returned Date & Time" },
-        { label: "Days Overdue", align: "right" },
-        { label: "Fine Amount (PHP)", align: "right" },
-        { label: "Payment Status", align: "center" },
+        { label: "Active Violations", align: "right" },
+        { label: "Cleared", align: "right" },
+        { label: "Current Standing / Penalty" },
+        { label: "Borrowing Restriction" },
+        { label: "Latest Violation Date & Time" },
       ],
       "#B45309"
     ),
-    ...(finesLedger.length > 0
-      ? [
-          ...finesLedger.map((f, i) => {
-            const bg = i % 2 === 1 ? "#FFFBEB" : undefined;
-            const payLabel = f.fine_paid ? "Paid" : f.is_accruing ? "Accruing" : "Unpaid";
-            return [
-              strCell(f.student_name, { fontWeight: "bold", backgroundColor: bg }),
-              strCell(f.student_number || "—", { backgroundColor: bg }),
-              strCell(f.student_section || "—", { backgroundColor: bg }),
-              strCell(f.book_title, { fontWeight: "bold", backgroundColor: bg }),
-              strCell(f.accession_number || "—", { backgroundColor: bg }),
-              strCell(f.status, { align: "center", backgroundColor: bg }),
-              strCell(formatDateTime(f.date_borrowed), { backgroundColor: bg }),
-              strCell(formatDateTime(f.due_date), { backgroundColor: bg }),
-              strCell(formatDateTime(f.date_returned), { backgroundColor: bg }),
-              numCell(f.days_overdue, { backgroundColor: bg }),
-              moneyCell(f.fine_amount, { fontWeight: "bold", backgroundColor: bg }),
-              strCell(payLabel, {
-                align: "center",
-                fontWeight: "bold",
-                backgroundColor: f.fine_paid ? "#ECFDF5" : f.is_accruing ? "#FEF3C7" : "#FEE2E2",
-                textColor: f.fine_paid ? "#047857" : f.is_accruing ? "#B45309" : "#B91C1C",
-              }),
-            ];
-          }),
-          [
-            strCell("PENDING FINES", { fontWeight: "bold", backgroundColor: "#FEF3C7", textColor: "#92400E" }),
-            moneyCell(pendingFines, { fontWeight: "bold", backgroundColor: "#FEF3C7", textColor: "#92400E" }),
-            strCell("COLLECTED FINES", { fontWeight: "bold", backgroundColor: "#ECFDF5", textColor: "#065F46" }),
-            moneyCell(paidFines, { fontWeight: "bold", backgroundColor: "#ECFDF5", textColor: "#065F46" }),
-            strCell("", { backgroundColor: "#F1F5F9" }),
-            strCell("", { backgroundColor: "#F1F5F9" }),
-            strCell("", { backgroundColor: "#F1F5F9" }),
-            strCell("", { backgroundColor: "#F1F5F9" }),
-            strCell("", { backgroundColor: "#F1F5F9" }),
-            strCell("COMBINED", { align: "right", fontWeight: "bold", backgroundColor: "#F1F5F9" }),
-            moneyCell(pendingFines + paidFines, { fontWeight: "bold", backgroundColor: "#F1F5F9" }),
-            strCell(`${finesLedger.length} records`, { align: "center", backgroundColor: "#F1F5F9" }),
-          ],
-        ]
-      : [emptyNoticeRow("No recorded or accruing fines.", 12)]),
+    ...(violationBundle.studentsWithViolations.length > 0
+      ? violationBundle.studentsWithViolations.map((st, i) => {
+          const bg = i % 2 === 1 ? "#FFFBEB" : undefined;
+          return [
+            strCell(st.studentName, { fontWeight: "bold", backgroundColor: bg }),
+            strCell(st.studentNumber, { backgroundColor: bg }),
+            strCell(st.studentSection, { backgroundColor: bg }),
+            numCell(st.activeViolationCount, {
+              fontWeight: "bold",
+              textColor: st.activeViolationCount > 0 ? "#B91C1C" : "#64748B",
+              backgroundColor: bg,
+            }),
+            numCell(st.clearedViolationCount, { textColor: "#047857", backgroundColor: bg }),
+            strCell(st.standingLabel, {
+              fontWeight: "bold",
+              backgroundColor: st.standingTone === "red" ? "#FEE2E2" : st.standingTone === "amber" ? "#FEF3C7" : "#ECFDF5",
+              textColor: st.standingTone === "red" ? "#991B1B" : st.standingTone === "amber" ? "#92400E" : "#047857",
+            }),
+            strCell(
+              st.isBanned
+                ? st.blockedByUnreturnedOverdue
+                  ? "Return overdue book first"
+                  : st.banEndsAt
+                  ? `Forbidden until ${formatDateTime(st.banEndsAt)} (${st.banRemainingLabel})`
+                  : "Borrowing restricted"
+                : "Allowed to borrow",
+              {
+                textColor: st.isBanned ? "#991B1B" : "#047857",
+                backgroundColor: bg,
+              }
+            ),
+            strCell(formatDateTime(st.latestViolationAt), { backgroundColor: bg }),
+          ];
+        })
+      : [emptyNoticeRow("No student violations recorded.", 8)]),
   ];
 
-  // ── Sheet 7: Popular Books ──
+  // ── Sheet 7: Top Borrowers (Students) ──
+  const topBorrowersData: Row[] = [
+    bannerRow(`TOP BORROWING STUDENTS (${topBorrowers.length} STUDENTS)`, 11, "#065F46"),
+    subtitleRow(metaLine, 11),
+    tableHeaderRow([
+      { label: "Rank", align: "center" },
+      { label: "Student Name" },
+      { label: "Student #" },
+      { label: "Section" },
+      { label: "Grade / Program" },
+      { label: "Total Borrowed", align: "right" },
+      { label: "Currently Out", align: "right" },
+      { label: "Returned On Time", align: "right" },
+      { label: "Active Violations", align: "right" },
+      { label: "Standing", align: "center" },
+      { label: "Last Borrowed Date & Time" },
+    ]),
+    ...(topBorrowers.length > 0
+      ? topBorrowers.map((tb, i) => {
+          const bg = i === 0 ? "#ECFDF5" : i % 2 === 1 ? "#F8FAFC" : undefined;
+          return [
+            numCell(tb.rank, { align: "center", fontWeight: "bold", backgroundColor: bg }),
+            strCell(tb.studentName, { fontWeight: "bold", backgroundColor: bg }),
+            strCell(tb.studentNumber, { backgroundColor: bg }),
+            strCell(tb.studentSection, { backgroundColor: bg }),
+            strCell([tb.gradeLevel, tb.program].filter(Boolean).join(" • ") || "—", { backgroundColor: bg }),
+            numCell(tb.totalBorrowed, { fontWeight: "bold", textColor: "#047857", backgroundColor: bg }),
+            numCell(tb.currentlyBorrowed, { textColor: "#1D4ED8", backgroundColor: bg }),
+            numCell(tb.returnedOnTime, { backgroundColor: bg }),
+            numCell(tb.activeViolations, { textColor: tb.activeViolations > 0 ? "#B91C1C" : "#64748B", backgroundColor: bg }),
+            strCell(tb.standingLabel, {
+              align: "center",
+              fontWeight: "bold",
+              backgroundColor: tb.standingTone === "red" ? "#FEE2E2" : tb.standingTone === "amber" ? "#FEF3C7" : "#ECFDF5",
+              textColor: tb.standingTone === "red" ? "#991B1B" : tb.standingTone === "amber" ? "#92400E" : "#047857",
+            }),
+            strCell(formatDateTime(tb.lastBorrowedAt), { backgroundColor: bg }),
+          ];
+        })
+      : [emptyNoticeRow("No student borrowing history recorded yet.", 11)]),
+  ];
+
+  // ── Sheet 8: Popular Books ──
   const popularData: Row[] = [
     bannerRow("MOST BORROWED TITLES", 6, "#065F46"),
     subtitleRow(metaLine, 6),
@@ -1366,33 +1399,46 @@ export async function exportFullLibraryExcel(
       : [emptyNoticeRow("No checkout data available.", 6)]),
   ];
 
-  // ── Sheet 8: School Year Summary ──
+  // ── Sheet 9: School Year Summary ──
   const syData: Row[] = [
-    bannerRow("SCHOOL YEAR CIRCULATION SUMMARY", 7, "#065F46"),
-    subtitleRow(metaLine, 7),
+    bannerRow("SCHOOL YEAR CIRCULATION & VIOLATIONS SUMMARY", 8, "#065F46"),
+    subtitleRow(metaLine, 8),
     tableHeaderRow([
       { label: "School Year" },
-      { label: "Total Transactions", align: "right" },
-      { label: "Currently Borrowed", align: "right" },
+      { label: "Academic Period" },
+      { label: "Total Loans", align: "right" },
+      { label: "Unique Students", align: "right" },
+      { label: "Borrowed (On Time)", align: "right" },
       { label: "Returned", align: "right" },
       { label: "Overdue", align: "right" },
-      { label: "Total Fines (PHP)", align: "right" },
-      { label: "Fines Collected (PHP)", align: "right" },
+      { label: "Active Violations", align: "right" },
     ]),
     ...(schoolYearSummaries.length > 0
       ? schoolYearSummaries.map((sy, i) => {
           const bg = i % 2 === 1 ? "#F8FAFC" : undefined;
+          const period =
+            sy.start_date && sy.end_date
+              ? formatSchoolYearDateRange(sy.start_date, sy.end_date)
+              : "—";
           return [
-            strCell(sy.school_year_name, { fontWeight: "bold", backgroundColor: bg }),
+            strCell(`${sy.school_year_name}${sy.is_active ? " (Active)" : ""}`, {
+              fontWeight: "bold",
+              textColor: sy.is_active ? "#047857" : "#0F172A",
+              backgroundColor: bg,
+            }),
+            strCell(period, { textColor: "#475569", backgroundColor: bg }),
             numCell(sy.total_transactions, { fontWeight: "bold", backgroundColor: bg }),
+            numCell(sy.unique_students ?? 0, { backgroundColor: bg }),
             numCell(sy.currently_borrowed, { textColor: "#047857", backgroundColor: bg }),
             numCell(sy.returned, { textColor: "#1D4ED8", backgroundColor: bg }),
             numCell(sy.overdue, { textColor: sy.overdue > 0 ? "#B91C1C" : "#64748B", backgroundColor: bg }),
-            moneyCell(Number(sy.total_fines ?? 0), { backgroundColor: bg }),
-            moneyCell(Number(sy.fines_collected ?? 0), { textColor: "#047857", fontWeight: "bold", backgroundColor: bg }),
+            numCell(sy.violations_count ?? 0, {
+              textColor: (sy.violations_count ?? 0) > 0 ? "#B45309" : "#64748B",
+              backgroundColor: bg,
+            }),
           ];
         })
-      : [emptyNoticeRow("No school year summaries available.", 7)]),
+      : [emptyNoticeRow("No school year summaries available.", 8)]),
   ];
 
   const sheets: Sheet<File | Blob | ArrayBuffer>[] = [
@@ -1400,7 +1446,7 @@ export async function exportFullLibraryExcel(
       sheet: "Executive Summary",
       data: summaryData,
       orientation: "landscape",
-      columns: [{ width: 38 }, { width: 18 }, { width: 44 }, { width: 20 }, { width: 16 }],
+      columns: [{ width: 38 }, { width: 18 }, { width: 48 }, { width: 20 }, { width: 18 }],
     },
     {
       sheet: "Circulation Activity",
@@ -1453,8 +1499,7 @@ export async function exportFullLibraryExcel(
         { width: 24 },
         { width: 16 },
         { width: 14 },
-        { width: 18 },
-        { width: 14 },
+        { width: 26 },
       ],
     },
     {
@@ -1473,28 +1518,42 @@ export async function exportFullLibraryExcel(
         { width: 24 },
         { width: 24 },
         { width: 18 },
-        { width: 15 },
-        { width: 14 },
+        { width: 26 },
       ],
     },
     {
-      sheet: "Fines Ledger",
-      data: finesData,
+      sheet: "Student Violations",
+      data: violationsData,
       orientation: "landscape",
       stickyRowsCount: 3,
       columns: [
-        { width: 24 },
-        { width: 15 },
+        { width: 26 },
         { width: 16 },
-        { width: 30 },
         { width: 16 },
-        { width: 14 },
-        { width: 24 },
-        { width: 24 },
-        { width: 24 },
-        { width: 14 },
         { width: 18 },
+        { width: 12 },
+        { width: 28 },
+        { width: 34 },
+        { width: 24 },
+      ],
+    },
+    {
+      sheet: "Top Borrowers",
+      data: topBorrowersData,
+      orientation: "landscape",
+      stickyRowsCount: 3,
+      columns: [
+        { width: 10 },
+        { width: 26 },
+        { width: 16 },
+        { width: 16 },
+        { width: 22 },
+        { width: 16 },
         { width: 15 },
+        { width: 18 },
+        { width: 16 },
+        { width: 24 },
+        { width: 24 },
       ],
     },
     {
@@ -1518,12 +1577,13 @@ export async function exportFullLibraryExcel(
       stickyRowsCount: 3,
       columns: [
         { width: 22 },
-        { width: 20 },
-        { width: 20 },
+        { width: 26 },
+        { width: 15 },
         { width: 16 },
-        { width: 16 },
         { width: 20 },
-        { width: 22 },
+        { width: 14 },
+        { width: 14 },
+        { width: 18 },
       ],
     },
   ];

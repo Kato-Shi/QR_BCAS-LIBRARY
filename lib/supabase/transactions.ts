@@ -1,6 +1,12 @@
 import { createClient } from "@/utils/client";
 import { logActivity, getCurrentActor } from "@/lib/supabase/activity-logs";
 import { archiveRecord } from "@/lib/supabase/archive";
+import {
+  formatBanDuration,
+  formatOrdinal,
+  getStudentViolationStatus,
+} from "@/lib/supabase/violations";
+import { getActiveSchoolYear } from "@/lib/supabase/school-years";
 import { ensureServerNow, getServerNow } from "@/lib/server-clock";
 import type { ActorInfo, BorrowingTransaction, BorrowingTransactionWithDetails } from "@/lib/types";
 
@@ -150,13 +156,37 @@ export async function borrowBook(
     return returnBook(existingTx.id, resolved);
   }
 
-  // 3. Check student borrow limit
+  // 3. Enforce student violation borrowing ban (anchored to authoritative server clock)
+  const serverNow = await ensureServerNow(true);
+  const violationStatus = await getStudentViolationStatus(student.id, serverNow);
+  if (violationStatus.isBanned) {
+    const offenseLabel = `${formatOrdinal(violationStatus.activeViolationCount)} violation`;
+    if (violationStatus.blockedByUnreturnedOverdue) {
+      throw new Error(
+        `Borrowing suspended (${offenseLabel} — ${violationStatus.currentRule?.label ?? "Borrowing Ban"}). ${student.name} must return their overdue book before borrowing again.`
+      );
+    }
+    const untilText = violationStatus.banEndsAt
+      ? new Date(violationStatus.banEndsAt).toLocaleString("en-US", {
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        })
+      : "further notice";
+    throw new Error(
+      `Borrowing suspended (${offenseLabel} — ${violationStatus.currentRule?.label ?? "Borrowing Ban"}). ${student.name} is forbidden from borrowing until ${untilText}${violationStatus.banRemainingLabel ? ` (${violationStatus.banRemainingLabel})` : ""}.`
+    );
+  }
+
+  // 4. Check student borrow limit
   const canBorrow = await canStudentBorrow(student.id);
   if (!canBorrow) {
     throw new Error("Student has reached the maximum borrowing limit of 2 books.");
   }
 
-  // 4. Check book is available and borrowable
+  // 5. Check book is available and borrowable
   const { data: book, error: bookError } = await supabase
     .from("books")
     .select("*")
@@ -167,9 +197,9 @@ export async function borrowBook(
   if (book.status !== "Available") throw new Error("Book is not available.");
   if (book.is_library_use_only) throw new Error("This material is Library Use Only and cannot be borrowed.");
 
-  // 5. Create the transaction (due in 5 days based on authoritative server clock)
-  const serverNow = await ensureServerNow(true);
+  // 6. Create the transaction (due in 5 days based on authoritative server clock)
   const dueDate = new Date(serverNow.getTime() + 5 * 24 * 60 * 60 * 1000);
+  const activeSchoolYear = await getActiveSchoolYear().catch(() => null);
 
   const insertPayload: Record<string, unknown> = {
     student_id: student.id,
@@ -177,6 +207,7 @@ export async function borrowBook(
     date_borrowed: serverNow.toISOString(),
     due_date: dueDate.toISOString(),
     status: "Active",
+    ...(activeSchoolYear?.id ? { school_year_id: activeSchoolYear.id } : {}),
     ...handledByColumns(resolved),
   };
 
@@ -186,11 +217,14 @@ export async function borrowBook(
     .select()
     .single();
 
-  // Pre-005-migration DBs lack the handled_by_* columns — retry without them.
+  // Pre-005-migration DBs lack the handled_by_* or school_year_id columns — retry without them.
   if (error && isMissingColumnError(error)) {
     delete insertPayload.handled_by_staff_id;
     delete insertPayload.handled_by_name;
     delete insertPayload.handled_by_role;
+    if (/school_year_id/i.test(String((error as { message?: string })?.message ?? ""))) {
+      delete insertPayload.school_year_id;
+    }
     const retry = await supabase
       .from("borrowing_transactions")
       .insert(insertPayload)
@@ -219,14 +253,13 @@ export async function borrowBook(
   return data;
 }
 
-/** Return a book and calculate fine if overdue */
+/** Return a book and record overdue violation status (monetary fines disabled per policy) */
 export async function returnBook(transactionId: string, actor?: ActorInfo | null): Promise<BorrowingTransaction> {
   const resolved = actor ?? (await getCurrentActor().catch(() => null));
 
-  // First, calculate the fine
   const { data: transaction, error: fetchError } = await supabase
     .from("borrowing_transactions")
-    .select("due_date, students(name), books(title)")
+    .select("student_id, due_date, students(name), books(title)")
     .eq("id", transactionId)
     .single();
 
@@ -234,24 +267,14 @@ export async function returnBook(transactionId: string, actor?: ActorInfo | null
 
   const dueDate = new Date(transaction.due_date);
   const now = await ensureServerNow(true);
+  const isLate = now.getTime() > dueDate.getTime();
   const daysOverdue = Math.max(0, Math.floor((now.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24)));
 
-  // Get fine rate from settings
-  const { data: fineSettings } = await supabase
-    .from("fine_settings")
-    .select("fine_rate_per_day, max_fine")
-    .limit(1)
-    .maybeSingle();
-
-  const fineRate = Number(fineSettings?.fine_rate_per_day ?? 5);
-  const maxFine = Number(fineSettings?.max_fine ?? 500);
-  const fineAmount = Math.min(daysOverdue * fineRate, maxFine);
-
-  // Update the transaction with return date and fine
+  // Update the transaction with return date (no monetary fine assessed)
   const updatePayload: Record<string, unknown> = {
     status: "Returned",
     date_returned: now.toISOString(),
-    fine_amount: fineAmount,
+    fine_amount: 0,
     ...handledByColumns(resolved),
   };
 
@@ -291,24 +314,48 @@ export async function returnBook(transactionId: string, actor?: ActorInfo | null
   }
 
   const txAny = transaction as unknown as {
+    student_id?: string;
     students?: { name?: string } | null;
     books?: { title?: string } | null;
   };
   const bookTitle = txAny.books?.title ?? "book";
   const studentName = txAny.students?.name ?? "student";
 
+  let violationSummary = " (returned on time)";
+  let violationMetadata: Record<string, unknown> = { is_late: false };
+  if (isLate && txAny.student_id) {
+    try {
+      const status = await getStudentViolationStatus(txAny.student_id, now);
+      const offenseText = formatOrdinal(status.activeViolationCount);
+      const penaltyText =
+        status.currentRule?.action === "ban" && (status.currentRule.banDays ?? 0) > 0
+          ? `${formatBanDuration(status.currentRule.banDays)} borrowing ban`
+          : status.currentRule?.label ?? "Warning";
+      violationSummary = ` (late return — ${offenseText} violation: ${penaltyText})`;
+      violationMetadata = {
+        is_late: true,
+        days_overdue: daysOverdue,
+        violation_count: status.activeViolationCount,
+        penalty: penaltyText,
+        ban_ends_at: status.banEndsAt,
+      };
+    } catch {
+      violationSummary = " (returned late — violation recorded)";
+      violationMetadata = { is_late: true, days_overdue: daysOverdue };
+    }
+  }
+
   await logActivity({
     action: "RETURN",
     entity_type: "transaction",
     entity_id: transactionId,
     description:
-      `"${bookTitle}" returned by ${studentName}` +
-      (fineAmount > 0 ? ` (overdue fine ₱${fineAmount.toFixed(2)})` : " (no fine)") +
+      `"${bookTitle}" returned by ${studentName}${violationSummary}` +
       (resolved ? ` — handled by ${resolved.name}, ${resolved.role}` : ""),
     metadata: {
       book_title: bookTitle,
       student_name: studentName,
-      fine_amount: fineAmount,
+      ...violationMetadata,
     },
     actor: resolved,
   });

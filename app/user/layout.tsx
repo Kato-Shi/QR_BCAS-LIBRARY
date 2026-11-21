@@ -18,11 +18,13 @@ import {
   User,
   Archive,
   ScrollText,
+  AlertTriangle,
 } from "lucide-react";
 import { logout } from "@/app/auth/actions";
 import type { SessionData } from "@/app/auth/actions";
 import { getEffectiveSession, clearClientSession } from "@/lib/client-session";
 import { syncServerClock } from "@/lib/server-clock";
+import { isSupabaseConfigured } from "@/utils/client";
 import {
   getNotificationsWithDetails,
   markNotificationRead,
@@ -64,6 +66,7 @@ export default function UserLayout({ children }: { children: React.ReactNode }) 
   const [notifOpen, setNotifOpen] = useState(false);
   const [logoutOpen, setLogoutOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [supabaseConnected] = useState<boolean>(() => isSupabaseConfigured());
   const closeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const notifRef = useRef<HTMLDivElement>(null);
 
@@ -385,6 +388,26 @@ export default function UserLayout({ children }: { children: React.ReactNode }) 
             </div>
           </div>
         </header>
+
+        {!supabaseConnected && (
+          <div className="bg-amber-50 border-b border-amber-200 px-4 sm:px-6 py-3 flex items-start gap-2.5 text-xs sm:text-sm text-amber-900 shrink-0">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold">Database not connected in this deployment.</span>{" "}
+              Your Supabase database is safe, but{" "}
+              <code className="px-1 py-0.5 rounded bg-amber-100 font-mono text-xs">
+                NEXT_PUBLIC_SUPABASE_URL
+              </code>{" "}
+              and{" "}
+              <code className="px-1 py-0.5 rounded bg-amber-100 font-mono text-xs">
+                NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+              </code>{" "}
+              are missing from this host&apos;s environment variables (e.g. Cloudflare Workers{" "}
+              <strong>Settings → Variables and Secrets</strong> &amp; <strong>Build variables</strong>).
+              Add them and redeploy to restore live data.
+            </div>
+          </div>
+        )}
 
         {/* Page content */}
         <main className="flex-1 overflow-auto p-4 sm:p-6">{children}</main>

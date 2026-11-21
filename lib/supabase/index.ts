@@ -104,12 +104,39 @@ export {
 export type { FineLedgerItem } from "./fines";
 
 export {
+  DEFAULT_VIOLATION_RULES,
+  getDefaultViolationPolicy,
+  getViolationPolicy,
+  saveViolationPolicy,
+  getRuleForOffense,
+  isTransactionViolation,
+  evaluateAllStudentViolations,
+  getStudentViolationStatus,
+  setTransactionViolationCleared,
+  buildTopBorrowingStudents,
+  formatOrdinal,
+  formatBanDuration,
+  formatViolationPolicySummary,
+} from "./violations";
+export type { ViolationEvaluationBundle } from "./violations";
+
+export {
+  SCHOOL_YEAR_CHANGED_EVENT,
+  parseSchoolYearDate,
+  formatSchoolYearDate,
+  formatSchoolYearDateRange,
+  getSchoolYearPhase,
+  suggestNextSchoolYear,
+  resolveTransactionSchoolYearId,
+  buildSchoolYearSummaries,
   getSchoolYears,
   getActiveSchoolYear,
   createSchoolYear,
   updateSchoolYear,
   setActiveSchoolYear,
   deleteSchoolYear,
+  countUnassignedTransactions,
+  assignUnassignedTransactionsToSchoolYears,
   getSchoolYearSummaries,
 } from "./school-years";
 

@@ -65,6 +65,87 @@ export interface FineSetting {
   created_at: string;
 }
 
+export type ViolationActionType = "warning" | "ban";
+
+export interface ViolationRule {
+  /** 1-based offense number (1 = 1st violation, 2 = 2nd, etc. Last rule applies to Nth and above). */
+  level: number;
+  label: string;
+  action: ViolationActionType;
+  /** Number of days the student is forbidden from borrowing (0 when action === "warning"). */
+  banDays: number;
+  description: string;
+}
+
+export interface ViolationPolicy {
+  id?: string;
+  rules: ViolationRule[];
+  updatedAt?: string;
+  updatedBy?: string | null;
+}
+
+export interface StudentViolationIncident {
+  transactionId: string;
+  studentId: string;
+  studentName: string;
+  studentNumber: string;
+  studentSection: string;
+  bookTitle: string;
+  bookAuthor: string;
+  accessionNumber: string;
+  category: string;
+  dateBorrowed: string;
+  dueDate: string;
+  dateReturned: string | null;
+  status: BorrowStatus;
+  daysOverdue: number;
+  overdueLabel: string;
+  /** Offense number for this student (1, 2, 3, ...), or 0 if forgiven/cleared. */
+  offenseNumber: number;
+  ruleApplied: ViolationRule | null;
+  cleared: boolean;
+}
+
+export interface StudentViolationStatus {
+  studentId: string;
+  studentName: string;
+  studentNumber: string;
+  studentSection: string;
+  gradeLevel: string;
+  program: string;
+  activeViolationCount: number;
+  clearedViolationCount: number;
+  currentRule: ViolationRule | null;
+  isBanned: boolean;
+  /** True when the student has an active unreturned overdue item triggering a ban. */
+  blockedByUnreturnedOverdue: boolean;
+  banStartsAt: string | null;
+  banEndsAt: string | null;
+  banRemainingLabel: string | null;
+  standingLabel: string;
+  standingTone: "emerald" | "amber" | "red";
+  incidents: StudentViolationIncident[];
+  latestViolationAt: string | null;
+}
+
+export interface TopBorrowerStudentRow {
+  rank: number;
+  studentId: string;
+  studentName: string;
+  studentNumber: string;
+  studentSection: string;
+  gradeLevel: string;
+  program: string;
+  totalBorrowed: number;
+  currentlyBorrowed: number;
+  returnedOnTime: number;
+  lateReturns: number;
+  activeViolations: number;
+  standingLabel: string;
+  standingTone: "emerald" | "amber" | "red";
+  lastBorrowedAt: string;
+}
+
 export interface SchoolYear {
   id: string;
   name: string;
@@ -98,10 +179,15 @@ export interface StudentFine {
 export interface SchoolYearSummary {
   school_year_id: string;
   school_year_name: string;
+  start_date?: string;
+  end_date?: string;
+  is_active?: boolean;
   total_transactions: number;
   currently_borrowed: number;
   returned: number;
   overdue: number;
+  violations_count?: number;
+  unique_students?: number;
   total_fines: number;
   fines_collected: number;
 }

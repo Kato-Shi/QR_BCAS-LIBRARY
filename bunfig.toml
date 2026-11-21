@@ -1,0 +1,3 @@
+[install]
+# Limit concurrent registry connections to avoid socket stalls on cold container boots
+networkConcurrency = 16
