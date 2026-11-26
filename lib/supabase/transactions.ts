@@ -8,7 +8,16 @@ import {
 } from "@/lib/supabase/violations";
 import { getActiveSchoolYear } from "@/lib/supabase/school-years";
 import { ensureServerNow, getServerNow } from "@/lib/server-clock";
+import { normalizeBookMaterial } from "@/lib/materials";
 import type { ActorInfo, BorrowingTransaction, BorrowingTransactionWithDetails } from "@/lib/types";
+
+function hydrateTransaction(tx: BorrowingTransactionWithDetails): BorrowingTransactionWithDetails {
+  if (!tx || !tx.books) return tx;
+  return {
+    ...tx,
+    books: normalizeBookMaterial(tx.books),
+  };
+}
 
 const supabase = createClient();
 
@@ -40,7 +49,7 @@ export async function getTransactions(): Promise<BorrowingTransactionWithDetails
     .order("created_at", { ascending: false });
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((tx: BorrowingTransactionWithDetails) => hydrateTransaction(tx));
 }
 
 export async function getActiveTransactions(): Promise<BorrowingTransactionWithDetails[]> {
@@ -51,11 +60,11 @@ export async function getActiveTransactions(): Promise<BorrowingTransactionWithD
       students(id, name, section, student_number, first_name, last_name, middle_name, grade_level, program),
       books(*, classifications(id, name))
     `)
-    .eq("status", "Active")
+    .in("status", ["Active", "Overdue"])
     .order("due_date");
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((tx: BorrowingTransactionWithDetails) => hydrateTransaction(tx));
 }
 
 export async function getStudentTransactions(studentId: string): Promise<BorrowingTransactionWithDetails[]> {
@@ -70,7 +79,7 @@ export async function getStudentTransactions(studentId: string): Promise<Borrowi
     .order("created_at", { ascending: false });
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((tx: BorrowingTransactionWithDetails) => hydrateTransaction(tx));
 }
 
 export async function getTransactionById(id: string): Promise<BorrowingTransactionWithDetails | null> {
@@ -85,7 +94,7 @@ export async function getTransactionById(id: string): Promise<BorrowingTransacti
     .single();
 
   if (error) throw error;
-  return data;
+  return data ? hydrateTransaction(data as BorrowingTransactionWithDetails) : null;
 }
 
 // ── Borrow Logic ──────────────────────────────────────────────
@@ -108,16 +117,20 @@ export async function canStudentBorrow(studentId: string): Promise<boolean> {
   return count < 2;
 }
 
-/** Borrow or return a book - finds student by student_number, checks for active transaction */
+/** Borrow or return a material - finds student by student_number, checks for active transaction */
 export async function borrowBook(
   studentNumber: string,
   bookId: string,
   actor?: ActorInfo | null,
+  options?: { borrowOnly?: boolean }
 ): Promise<BorrowingTransaction> {
   const resolved = actor ?? (await getCurrentActor().catch(() => null));
 
-  // Auto-return mode: no student number, just return the book directly
+  // Auto-return mode: no student number, just return the material directly
   if (!studentNumber.trim()) {
+    if (options?.borrowOnly) {
+      throw new Error("Please enter a valid student ID to borrow this material.");
+    }
     const { data: activeTx, error: txError } = await supabase
       .from("borrowing_transactions")
       .select("id")
@@ -127,7 +140,7 @@ export async function borrowBook(
       .maybeSingle();
 
     if (txError || !activeTx)
-      throw new Error("No active borrow found for this book.");
+      throw new Error("No active borrow found for this material.");
     return returnBook(activeTx.id, resolved);
   }
 
@@ -142,7 +155,7 @@ export async function borrowBook(
     throw new Error(`Student with ID "${studentNumber.trim()}" is not registered in the system.`);
   }
 
-  // 2. Check if student already has this book borrowed → return it
+  // 2. Check if student already has this material borrowed → return it (unless strict borrowOnly mode)
   const { data: existingTx } = await supabase
     .from("borrowing_transactions")
     .select("id")
@@ -153,6 +166,9 @@ export async function borrowBook(
     .maybeSingle();
 
   if (existingTx) {
+    if (options?.borrowOnly) {
+      throw new Error(`${student.name} currently has this material borrowed. Use the Return submenu to process its return.`);
+    }
     return returnBook(existingTx.id, resolved);
   }
 

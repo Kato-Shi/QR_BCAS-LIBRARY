@@ -19,6 +19,9 @@ import {
   Archive,
   ScrollText,
   AlertTriangle,
+  ChevronDown,
+  ArrowUpRight,
+  ArrowDownLeft,
 } from "lucide-react";
 import { logout } from "@/app/auth/actions";
 import type { SessionData } from "@/app/auth/actions";
@@ -38,17 +41,49 @@ import {
   LOGOUT_REASON_KEY,
 } from "@/hooks/use-idle-logout";
 
-const sidebarNav: {
+interface SidebarChildItem {
+  label: string;
+  icon: typeof LayoutDashboard;
+  href: string;
+  exact?: boolean;
+}
+
+interface SidebarNavItem {
   label: string;
   icon: typeof LayoutDashboard;
   href: string;
   adminOnly?: boolean;
   hideForStaff?: boolean;
-}[] = [
+  children?: SidebarChildItem[];
+}
+
+const sidebarNav: SidebarNavItem[] = [
   { label: "Dashboard", icon: LayoutDashboard, href: "/user" },
-  { label: "Borrow/Return", icon: ArrowLeftRight, href: "/user/scan" },
-  { label: "Books", icon: BookOpen, href: "/user/books" },
-  { label: "Transactions", icon: ClipboardList, href: "/user/transactions" },
+  { label: "Quick QR Scan", icon: ArrowLeftRight, href: "/user/scan" },
+  { label: "Library Materials", icon: BookOpen, href: "/user/books" },
+  {
+    label: "Transactions",
+    icon: ClipboardList,
+    href: "/user/transactions",
+    children: [
+      {
+        label: "All Transactions",
+        icon: ClipboardList,
+        href: "/user/transactions",
+        exact: true,
+      },
+      {
+        label: "Borrow",
+        icon: ArrowUpRight,
+        href: "/user/transactions/borrow",
+      },
+      {
+        label: "Return",
+        icon: ArrowDownLeft,
+        href: "/user/transactions/return",
+      },
+    ],
+  },
   { label: "Reports", icon: BarChart3, href: "/user/reports" },
   { label: "Activity Logs", icon: ScrollText, href: "/user/logs" },
   { label: "Archive", icon: Archive, href: "/user/archive" },
@@ -59,6 +94,7 @@ export default function UserLayout({ children }: { children: React.ReactNode }) 
   const pathname = usePathname();
   const router = useRouter();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [txMenuOpen, setTxMenuOpen] = useState(true);
   const [session, setSession] = useState<SessionData | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [notifications, setNotifications] = useState<NotificationWithDetails[]>([]);
@@ -207,6 +243,58 @@ export default function UserLayout({ children }: { children: React.ReactNode }) 
 
         <nav className="flex-1 min-h-0 overflow-y-auto px-3 py-4 space-y-1 overscroll-contain">
           {filteredNav.map((item) => {
+            if (item.children && item.children.length > 0) {
+              const parentActive = pathname.startsWith(item.href);
+              const isOpen = txMenuOpen || parentActive;
+              return (
+                <div key={item.label} className="space-y-1">
+                  <button
+                    type="button"
+                    onClick={() => setTxMenuOpen((prev) => !prev)}
+                    className={`w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+                      parentActive
+                        ? "bg-emerald-900/80 text-white"
+                        : "text-emerald-100 hover:bg-emerald-700"
+                    }`}
+                  >
+                    <span className="flex items-center gap-3">
+                      <item.icon className="w-5 h-5" />
+                      {item.label}
+                    </span>
+                    <ChevronDown
+                      className={`w-4 h-4 transition-transform duration-150 ${
+                        isOpen ? "rotate-0" : "-rotate-90"
+                      }`}
+                    />
+                  </button>
+                  {isOpen && (
+                    <div className="ml-4 pl-3 border-l border-emerald-700/80 space-y-1">
+                      {item.children.map((child) => {
+                        const childActive = child.exact
+                          ? pathname === child.href
+                          : pathname.startsWith(child.href);
+                        return (
+                          <Link
+                            key={child.href}
+                            href={child.href}
+                            onClick={() => setSidebarOpen(false)}
+                            className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-medium transition-colors ${
+                              childActive
+                                ? "bg-emerald-950 text-white shadow-sm"
+                                : "text-emerald-100/90 hover:bg-emerald-700/80 hover:text-white"
+                            }`}
+                          >
+                            <child.icon className="w-4 h-4" />
+                            {child.label}
+                          </Link>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            }
+
             const isActive = item.href === "/user"
               ? pathname === "/user"
               : pathname.startsWith(item.href);

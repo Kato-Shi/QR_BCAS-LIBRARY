@@ -2,6 +2,13 @@ import { createClient } from "@/utils/client";
 import { logActivity, getCurrentActor } from "@/lib/supabase/activity-logs";
 import { archiveRecord } from "@/lib/supabase/archive";
 import { ensureServerNow } from "@/lib/server-clock";
+import {
+  encodeMaterialInNotes,
+  isMaterialEnumError,
+  normalizeBookMaterial,
+  normalizeMaterialType,
+  stripMaterialTag,
+} from "@/lib/materials";
 import type { ActorInfo, Book, BookWithClassification, BookStatus } from "@/lib/types";
 
 const supabase = createClient();
@@ -18,7 +25,7 @@ export async function getBooks(): Promise<BookWithClassification[]> {
     .order("title");
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((b: BookWithClassification) => normalizeBookMaterial(b));
 }
 
 export async function getBookById(id: string): Promise<BookWithClassification | null> {
@@ -29,7 +36,7 @@ export async function getBookById(id: string): Promise<BookWithClassification | 
     .single();
 
   if (error) throw error;
-  return data;
+  return data ? normalizeBookMaterial(data as BookWithClassification) : null;
 }
 
 export async function getBookByAccessionNumber(accessionNumber: string): Promise<BookWithClassification | null> {
@@ -40,7 +47,7 @@ export async function getBookByAccessionNumber(accessionNumber: string): Promise
     .single();
 
   if (error) throw error;
-  return data;
+  return data ? normalizeBookMaterial(data as BookWithClassification) : null;
 }
 
 export async function searchBooks(query: string): Promise<BookWithClassification[]> {
@@ -51,7 +58,7 @@ export async function searchBooks(query: string): Promise<BookWithClassification
     .order("title");
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((b: BookWithClassification) => normalizeBookMaterial(b));
 }
 
 export async function getBooksByClassification(classificationId: string): Promise<BookWithClassification[]> {
@@ -62,7 +69,7 @@ export async function getBooksByClassification(classificationId: string): Promis
     .order("title");
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((b: BookWithClassification) => normalizeBookMaterial(b));
 }
 
 export async function getAvailableBooks(): Promise<BookWithClassification[]> {
@@ -74,7 +81,7 @@ export async function getAvailableBooks(): Promise<BookWithClassification[]> {
     .order("title");
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((b: BookWithClassification) => normalizeBookMaterial(b));
 }
 
 export async function getBorrowableBooks(): Promise<BookWithClassification[]> {
@@ -86,7 +93,7 @@ export async function getBorrowableBooks(): Promise<BookWithClassification[]> {
     .order("title");
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((b: BookWithClassification) => normalizeBookMaterial(b));
 }
 
 export async function getLibraryUseOnlyBooks(): Promise<BookWithClassification[]> {
@@ -97,43 +104,159 @@ export async function getLibraryUseOnlyBooks(): Promise<BookWithClassification[]
     .order("title");
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((b: BookWithClassification) => normalizeBookMaterial(b));
 }
 
 // ── Write ──────────────────────────────────────────────────────
 
 export async function createBook(book: BookInsert, actor?: ActorInfo | null): Promise<Book> {
-  const { data, error } = await supabase
+  const resolvedType = normalizeMaterialType(book.material_type);
+  const cleanNotes = stripMaterialTag(book.notes);
+
+  let { data, error } = await supabase
     .from("books")
-    .insert(book)
+    .insert({
+      ...book,
+      material_type: resolvedType,
+      notes: cleanNotes,
+    })
     .select()
     .single();
 
+  // Pre-008-migration DBs only accept 'Book' | 'Non-Book' on the enum:
+  // fall back cleanly to 'Non-Book' with an encoded [Material: ...] tag in notes.
+  if (error && isMaterialEnumError(error) && resolvedType !== "Book") {
+    const retry = await supabase
+      .from("books")
+      .insert({
+        ...book,
+        material_type: "Non-Book",
+        notes: encodeMaterialInNotes(resolvedType, cleanNotes),
+      })
+      .select()
+      .single();
+    data = retry.data;
+    error = retry.error;
+  }
+
   if (error) throw error;
+
+  const normalized = normalizeBookMaterial(data as Book);
 
   const resolved = actor ?? (await getCurrentActor().catch(() => null));
   await logActivity({
     action: "ADD",
     entity_type: "book",
-    entity_id: (data as Book)?.id ?? null,
-    description: `Added book "${book.title}" by ${book.author} (Accession #: ${book.accession_number}).`,
-    metadata: { title: book.title, author: book.author, accession_number: book.accession_number },
+    entity_id: normalized?.id ?? null,
+    description: `Added ${resolvedType.toLowerCase()} "${book.title}" by ${book.author} (Accession #: ${book.accession_number}).`,
+    metadata: {
+      title: book.title,
+      author: book.author,
+      accession_number: book.accession_number,
+      material_type: resolvedType,
+    },
     actor: resolved,
   });
 
-  return data;
+  return normalized;
 }
 
 export async function updateBook(id: string, updates: BookUpdate, actor?: ActorInfo | null): Promise<Book> {
   const serverNow = await ensureServerNow();
-  const { data, error } = await supabase
+
+  // Preserve existing material tag if caller only updated unrelated fields (e.g. status/notes)
+  let nextMaterialType = updates.material_type
+    ? normalizeMaterialType(updates.material_type)
+    : undefined;
+  let existingRow: Book | null = null;
+
+  if (!nextMaterialType || updates.notes === undefined) {
+    try {
+      const { data: current } = await supabase
+        .from("books")
+        .select("*")
+        .eq("id", id)
+        .single();
+      if (current) {
+        existingRow = normalizeBookMaterial(current as Book);
+        if (!nextMaterialType) {
+          nextMaterialType = normalizeMaterialType(existingRow.material_type);
+        }
+      }
+    } catch {
+      // proceed with provided updates
+    }
+  }
+
+  const nextNotes =
+    updates.notes !== undefined
+      ? stripMaterialTag(updates.notes)
+      : existingRow
+      ? existingRow.notes
+      : undefined;
+
+  const payload: Record<string, unknown> = {
+    ...updates,
+    updated_at: serverNow.toISOString(),
+  };
+  if (updates.material_type !== undefined && nextMaterialType) {
+    payload.material_type = nextMaterialType;
+  }
+  if (nextNotes !== undefined) {
+    payload.notes = nextNotes;
+  }
+
+  let { data, error } = await supabase
     .from("books")
-    .update({ ...updates, updated_at: serverNow.toISOString() })
+    .update(payload)
     .eq("id", id)
     .select()
     .single();
 
+  // Pre-008-migration enum fallback: store as Non-Book + [Material: ...] tag in notes.
+  if (error && isMaterialEnumError(error) && nextMaterialType && nextMaterialType !== "Book") {
+    const fallbackPayload: Record<string, unknown> = {
+      ...payload,
+      material_type: "Non-Book",
+      notes: encodeMaterialInNotes(nextMaterialType, nextNotes ?? existingRow?.notes ?? null),
+    };
+    const retry = await supabase
+      .from("books")
+      .update(fallbackPayload)
+      .eq("id", id)
+      .select()
+      .single();
+    data = retry.data;
+    error = retry.error;
+  } else if (
+    !error &&
+    existingRow &&
+    updates.material_type === undefined &&
+    updates.notes !== undefined &&
+    data &&
+    (data as Book).material_type === "Non-Book" &&
+    existingRow.material_type !== "Book" &&
+    existingRow.material_type !== "Other Material"
+  ) {
+    // Keep the fallback material tag intact if only notes were edited on a pre-008 row.
+    const taggedNotes = encodeMaterialInNotes(
+      normalizeMaterialType(existingRow.material_type),
+      nextNotes
+    );
+    const preserve = await supabase
+      .from("books")
+      .update({ notes: taggedNotes, updated_at: serverNow.toISOString() })
+      .eq("id", id)
+      .select()
+      .single();
+    if (!preserve.error && preserve.data) {
+      data = preserve.data;
+    }
+  }
+
   if (error) throw error;
+
+  const normalized = normalizeBookMaterial(data as Book);
 
   const resolved = actor ?? (await getCurrentActor().catch(() => null));
   const changedKeys = Object.keys(updates).filter((k) => k !== "updated_at");
@@ -141,12 +264,12 @@ export async function updateBook(id: string, updates: BookUpdate, actor?: ActorI
     action: "EDIT",
     entity_type: "book",
     entity_id: id,
-    description: `Edited book "${(data as Book)?.title ?? id}" (changed: ${changedKeys.join(", ") || "—"}).`,
-    metadata: { changed_fields: changedKeys, updates },
+    description: `Edited ${normalized.material_type.toLowerCase()} "${normalized?.title ?? id}" (changed: ${changedKeys.join(", ") || "—"}).`,
+    metadata: { changed_fields: changedKeys, updates, material_type: normalized.material_type },
     actor: resolved,
   });
 
-  return data;
+  return normalized;
 }
 
 export async function updateBookStatus(id: string, status: BookStatus): Promise<Book> {
@@ -164,7 +287,9 @@ export async function deleteBook(id: string, actor?: ActorInfo | null): Promise<
   let snapshot: Record<string, unknown> | null = null;
   try {
     const { data } = await supabase.from("books").select("*").eq("id", id).single();
-    snapshot = (data as Record<string, unknown> | null) ?? null;
+    snapshot = data
+      ? (normalizeBookMaterial(data as Book) as unknown as Record<string, unknown>)
+      : null;
   } catch {
     snapshot = null;
   }
@@ -188,9 +313,16 @@ export async function deleteBook(id: string, actor?: ActorInfo | null): Promise<
     entity_type: "book",
     entity_id: id,
     description: snapshot
-      ? `Deleted book "${String(snapshot.title ?? id)}" by ${String(snapshot.author ?? "unknown")} (moved to archive).`
-      : `Deleted book ${id} (moved to archive).`,
-    metadata: snapshot ? { title: snapshot.title, author: snapshot.author, accession_number: snapshot.accession_number } : null,
+      ? `Deleted ${String(snapshot.material_type ?? "book").toLowerCase()} "${String(snapshot.title ?? id)}" by ${String(snapshot.author ?? "unknown")} (moved to archive).`
+      : `Deleted material ${id} (moved to archive).`,
+    metadata: snapshot
+      ? {
+          title: snapshot.title,
+          author: snapshot.author,
+          accession_number: snapshot.accession_number,
+          material_type: snapshot.material_type,
+        }
+      : null,
     actor: resolved,
   });
 }
@@ -198,11 +330,35 @@ export async function deleteBook(id: string, actor?: ActorInfo | null): Promise<
 // ── Bulk ──────────────────────────────────────────────────────
 
 export async function createBooks(books: BookInsert[]): Promise<Book[]> {
-  const { data, error } = await supabase
+  const prepared = books.map((b) => ({
+    ...b,
+    material_type: normalizeMaterialType(b.material_type),
+    notes: stripMaterialTag(b.notes),
+  }));
+
+  let { data, error } = await supabase
     .from("books")
-    .insert(books)
+    .insert(prepared)
     .select();
 
+  if (error && isMaterialEnumError(error)) {
+    const fallbackPrepared = prepared.map((b) =>
+      b.material_type === "Book"
+        ? b
+        : {
+            ...b,
+            material_type: "Non-Book" as const,
+            notes: encodeMaterialInNotes(b.material_type, b.notes),
+          }
+    );
+    const retry = await supabase
+      .from("books")
+      .insert(fallbackPrepared)
+      .select();
+    data = retry.data;
+    error = retry.error;
+  }
+
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).map((b: Book) => normalizeBookMaterial(b));
 }

@@ -1,6 +1,12 @@
 import { createClient } from "@/utils/client";
 import { logActivity } from "@/lib/supabase/activity-logs";
 import { ensureServerNow, getServerNowMs } from "@/lib/server-clock";
+import {
+  encodeMaterialInNotes,
+  isMaterialEnumError,
+  normalizeMaterialType,
+  stripMaterialTag,
+} from "@/lib/materials";
 import type { ActorInfo, ArchivedRecord } from "@/lib/types";
 
 const supabase = createClient();
@@ -136,20 +142,29 @@ export async function restoreArchivedBook(
 
   const snapshot = (record.data ?? {}) as Record<string, unknown>;
 
+  const resolvedType = normalizeMaterialType(String(snapshot.material_type ?? "Book"));
+  const cleanNotes = stripMaterialTag(typeof snapshot.notes === "string" ? snapshot.notes : null);
+
   const payload: Record<string, unknown> = {
     title: snapshot.title,
     author: snapshot.author,
     accession_number: snapshot.accession_number,
     classification_id: snapshot.classification_id,
     shelf_location: snapshot.shelf_location ?? null,
-    material_type: snapshot.material_type ?? "Book",
+    material_type: resolvedType,
     status: "Available",
     is_library_use_only: snapshot.is_library_use_only ?? false,
-    notes: snapshot.notes ?? null,
+    notes: cleanNotes,
   };
 
-  // Re-insert; if the accession number was re-used meanwhile, suffix it.
+  // Re-insert; handle pre-008 enum fallback and duplicate accession number gracefully.
   let { error } = await supabase.from("books").insert(payload);
+  if (error && isMaterialEnumError(error) && resolvedType !== "Book") {
+    payload.material_type = "Non-Book";
+    payload.notes = encodeMaterialInNotes(resolvedType, cleanNotes);
+    const retry = await supabase.from("books").insert(payload);
+    error = retry.error;
+  }
   if (error && /duplicate|unique|accession/i.test(error.message)) {
     payload.accession_number = `${String(payload.accession_number)}-R${getServerNowMs().toString().slice(-4)}`;
     const retry = await supabase.from("books").insert(payload);

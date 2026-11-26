@@ -7,6 +7,7 @@ import { getBookById } from "@/lib/supabase/books";
 import { getStudentByNumber } from "@/lib/supabase/students";
 import { borrowBook } from "@/lib/supabase/transactions";
 import { formatOrdinal, getStudentViolationStatus } from "@/lib/supabase/violations";
+import { getMaterialMeta } from "@/lib/materials";
 import { formatDateTime } from "@/lib/reports-excel";
 import type { BookWithClassification, Student, StudentViolationStatus } from "@/lib/types";
 
@@ -147,9 +148,20 @@ function BorrowForm() {
             </div>
           ) : (
             <>
-              {/* Book Info */}
+              {/* Material Info */}
               <div className="mb-5 p-4 rounded-lg bg-slate-50 border border-slate-200">
-                <p className="text-xs text-slate-400 uppercase tracking-wide mb-1">Book Details</p>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <p className="text-xs text-slate-400 uppercase tracking-wide">Material Details</p>
+                  {book && (
+                    <span
+                      className={`inline-flex px-2 py-0.5 rounded text-[11px] font-semibold ${
+                        getMaterialMeta(book.material_type).badgeClass
+                      }`}
+                    >
+                      {getMaterialMeta(book.material_type).label}
+                    </span>
+                  )}
+                </div>
                 <p className="text-sm font-semibold text-slate-900">{book?.title}</p>
                 <p className="text-xs text-slate-500 mt-0.5">{book?.author}</p>
                 <p className="text-xs text-slate-400 mt-0.5">Accession #: {book?.accession_number}</p>

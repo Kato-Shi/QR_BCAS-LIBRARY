@@ -17,11 +17,17 @@ import {
   Ban,
 } from "lucide-react";
 import PageHeader from "@/components/ui/page-header";
+import TransactionSubnav from "@/components/transactions/transaction-subnav";
 import Modal, { ConfirmModal } from "@/components/ui/modal";
 import SearchInput from "@/components/ui/search-input";
 import Select from "@/components/ui/select";
 import Badge from "@/components/ui/badge";
 import DataTable from "@/components/ui/data-table";
+import {
+  getMaterialMeta,
+  LIBRARY_MATERIAL_TYPES,
+  normalizeMaterialType,
+} from "@/lib/materials";
 import { getEffectiveSession } from "@/lib/client-session";
 import { canEdit, canDelete } from "@/lib/permissions";
 import {
@@ -57,6 +63,7 @@ export default function TransactionsPage() {
   const [schoolYearFilter, setSchoolYearFilter] = useState("all");
   const [dateRange, setDateRange] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
+  const [materialFilter, setMaterialFilter] = useState("all");
   const [allTransactions, setAllTransactions] = useState<BorrowingTransactionWithDetails[]>([]);
   const [schoolYears, setSchoolYears] = useState<SchoolYear[]>([]);
   const [policy, setPolicy] = useState<ViolationPolicy>(() => getDefaultViolationPolicy());
@@ -163,9 +170,13 @@ export default function TransactionsPage() {
         (typeFilter === "Overdue" && isOverdue) ||
         (typeFilter === "Violation" && Boolean(incident));
 
-      return matchesDateRange && matchesSearch && matchesType;
+      const matchesMaterial =
+        materialFilter === "all" ||
+        normalizeMaterialType(tx.books?.material_type) === materialFilter;
+
+      return matchesDateRange && matchesSearch && matchesType && matchesMaterial;
     });
-  }, [allTransactions, schoolYearFilter, schoolYears, search, dateRange, typeFilter, serverNow, violationBundle]);
+  }, [allTransactions, schoolYearFilter, schoolYears, search, dateRange, typeFilter, materialFilter, serverNow, violationBundle]);
 
   const filteredViolationCounts = useMemo(() => {
     let active = 0;
@@ -198,7 +209,7 @@ export default function TransactionsPage() {
 
   const handleExportCSV = () => {
     const header =
-      "Borrowed Date & Time,Returned Date & Time,Due Date & Time,Student,Student Number,Book,Author,Status,Violation Status,Handled By,Handler Role\n";
+      "Borrowed Date & Time,Returned Date & Time,Due Date & Time,Student,Student Number,Material Type,Title,Author/Creator,Status,Violation Status,Handled By,Handler Role\n";
     const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
     const body = filtered
       .map((tx) => {
@@ -209,6 +220,7 @@ export default function TransactionsPage() {
           esc(formatDateTime(tx.due_date)),
           esc(tx.students?.name ?? ""),
           esc(tx.students?.student_number ?? ""),
+          esc(normalizeMaterialType(tx.books?.material_type)),
           esc(tx.books?.title ?? ""),
           esc(tx.books?.author ?? ""),
           esc(tx.status),
@@ -316,13 +328,23 @@ export default function TransactionsPage() {
     },
     {
       key: "book",
-      header: "Book Details",
-      render: (row: BorrowingTransactionWithDetails) => (
-        <div>
-          <div className="font-medium text-slate-800">{row.books?.title ?? "—"}</div>
-          <div className="text-xs text-slate-500">{row.books?.author ?? ""}</div>
-        </div>
-      ),
+      header: "Material Details",
+      render: (row: BorrowingTransactionWithDetails) => {
+        const meta = getMaterialMeta(row.books?.material_type);
+        return (
+          <div>
+            <div className="flex items-center gap-1.5 mb-0.5">
+              <span
+                className={`inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold ${meta.badgeClass}`}
+              >
+                {meta.label}
+              </span>
+            </div>
+            <div className="font-medium text-slate-800">{row.books?.title ?? "—"}</div>
+            <div className="text-xs text-slate-500">{row.books?.author ?? ""}</div>
+          </div>
+        );
+      },
     },
     {
       key: "status",
@@ -460,10 +482,18 @@ export default function TransactionsPage() {
                 />
               )}
               <Select
+                value={materialFilter}
+                onChange={setMaterialFilter}
+                options={[
+                  { label: "All Materials", value: "all" },
+                  ...LIBRARY_MATERIAL_TYPES.map((t) => ({ label: t, value: t })),
+                ]}
+              />
+              <Select
                 value={typeFilter}
                 onChange={setTypeFilter}
                 options={[
-                  { label: "All Types", value: "all" },
+                  { label: "All Statuses", value: "all" },
                   { label: "Borrow (On Time)", value: "Borrow" },
                   { label: "Return", value: "Return" },
                   { label: "Overdue", value: "Overdue" },
@@ -488,6 +518,8 @@ export default function TransactionsPage() {
           }
         />
       </div>
+
+      <TransactionSubnav />
 
       {staffRestricted && (
         <div className="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-200 flex items-start gap-2 text-sm text-amber-800 animate-fade-in-up stagger-2 no-print">

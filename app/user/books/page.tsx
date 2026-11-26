@@ -21,6 +21,11 @@ import { getEffectiveSession } from "@/lib/client-session";
 import { getServerDateString, getServerNow } from "@/lib/server-clock";
 import { requestPrint } from "@/lib/print";
 import { canEdit, canDelete, STAFF_RESTRICTED_MESSAGE } from "@/lib/permissions";
+import {
+  getMaterialMeta,
+  LIBRARY_MATERIAL_TYPES,
+  normalizeMaterialType,
+} from "@/lib/materials";
 import Modal, { ConfirmModal } from "@/components/ui/modal";
 import type { BookWithClassification, Classification, BookStatus, MaterialType, StaffRole } from "@/lib/types";
 
@@ -82,6 +87,8 @@ function BookFormModal({
   onSubmit,
   onClose,
 }: BookFormModalProps) {
+  const materialMeta = getMaterialMeta(form.material_type);
+
   return (
     <Modal
       open={open}
@@ -92,7 +99,7 @@ function BookFormModal({
         <>
           <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors">Cancel</button>
           <button type="submit" form="book-form" disabled={submitting} className="px-4 py-2 rounded-lg bg-emerald-700 text-white text-sm font-medium hover:bg-emerald-800 transition-colors disabled:opacity-50">
-            {submitting ? "Saving..." : isEdit ? "Save Changes" : "Add Book"}
+            {submitting ? "Saving..." : isEdit ? "Save Changes" : `Add ${materialMeta.label}`}
           </button>
         </>
       }
@@ -102,17 +109,17 @@ function BookFormModal({
           <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">{formError}</div>
         )}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="sm:col-span-2">
-              <label className="block text-sm font-medium text-slate-700 mb-1">Title *</label>
-              <input type="text" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
-            </div>
-            <div className="sm:col-span-2">
-              <label className="block text-sm font-medium text-slate-700 mb-1">Author *</label>
-              <input type="text" value={form.author} onChange={(e) => setForm({ ...form, author: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
-            </div>
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">Accession Number *</label>
-              <input type="text" value={form.accession_number} onChange={(e) => setForm({ ...form, accession_number: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+              <label className="block text-sm font-medium text-slate-700 mb-1">Material Type *</label>
+              <select
+                value={normalizeMaterialType(form.material_type)}
+                onChange={(e) => setForm({ ...form, material_type: e.target.value as MaterialType })}
+                className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+              >
+                {LIBRARY_MATERIAL_TYPES.map((type) => (
+                  <option key={type} value={type}>{type}</option>
+                ))}
+              </select>
             </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Category *</label>
@@ -123,18 +130,23 @@ function BookFormModal({
                 ))}
               </select>
             </div>
+            <div className="sm:col-span-2">
+              <label className="block text-sm font-medium text-slate-700 mb-1">Title *</label>
+              <input type="text" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder={`Enter ${materialMeta.label.toLowerCase()} title`} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="block text-sm font-medium text-slate-700 mb-1">{materialMeta.creatorLabel} *</label>
+              <input type="text" value={form.author} onChange={(e) => setForm({ ...form, author: e.target.value })} placeholder={materialMeta.creatorPlaceholder} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Accession Number *</label>
+              <input type="text" value={form.accession_number} onChange={(e) => setForm({ ...form, accession_number: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+            </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Shelf Location</label>
-              <input type="text" value={form.shelf_location} onChange={(e) => setForm({ ...form, shelf_location: e.target.value })} placeholder="e.g. CS-A1-04" className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+              <input type="text" value={form.shelf_location} onChange={(e) => setForm({ ...form, shelf_location: e.target.value })} placeholder="e.g. PER-A2-01 or CS-A1-04" className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
             </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">Material Type</label>
-              <select value={form.material_type} onChange={(e) => setForm({ ...form, material_type: e.target.value as MaterialType })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500">
-                <option value="Book">Book</option>
-                <option value="Non-Book">Non-Book</option>
-              </select>
-            </div>
-            <div>
+            <div className="sm:col-span-2">
               <label className="block text-sm font-medium text-slate-700 mb-1">Status</label>
               <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value as BookStatus })} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500">
                 <option value="Available">Available</option>
@@ -144,13 +156,13 @@ function BookFormModal({
               </select>
             </div>
             <div className="sm:col-span-2">
-              <label className="block text-sm font-medium text-slate-700 mb-1">Notes</label>
-              <textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} rows={2} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
+              <label className="block text-sm font-medium text-slate-700 mb-1">Notes / Issue Details</label>
+              <textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} placeholder={materialMeta.notesPlaceholder} rows={2} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm bg-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500" />
             </div>
             <div className="sm:col-span-2">
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" checked={form.is_library_use_only} onChange={(e) => setForm({ ...form, is_library_use_only: e.target.checked })} className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
-                <span className="text-sm font-medium text-slate-700">Library Use Only</span>
+                <span className="text-sm font-medium text-slate-700">Library Use Only (cannot be checked out)</span>
               </label>
             </div>
           </div>
@@ -166,6 +178,7 @@ export default function BooksPage() {
   const [error, setError] = useState<string | null>(null);
 
   const [search, setSearch] = useState("");
+  const [materialType, setMaterialType] = useState("all");
   const [category, setCategory] = useState("all");
   const [status, setStatus] = useState("all");
   const [page, setPage] = useState(1);
@@ -214,17 +227,26 @@ export default function BooksPage() {
   // eslint-disable-next-line react-hooks/set-state-in-effect -- standard data-fetch pattern
   useEffect(() => { fetchData(); }, [fetchData]);
 
+  const materialCounts = books.reduce<Record<string, number>>((acc, b) => {
+    const key = normalizeMaterialType(b.material_type);
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+
   const filtered = books.filter((b) => {
     const catName = b.classifications?.name ?? "";
+    const resolvedType = normalizeMaterialType(b.material_type);
     const matchSearch =
       !search ||
       b.title.toLowerCase().includes(search.toLowerCase()) ||
       b.author.toLowerCase().includes(search.toLowerCase()) ||
       catName.toLowerCase().includes(search.toLowerCase()) ||
+      resolvedType.toLowerCase().includes(search.toLowerCase()) ||
       b.accession_number.toLowerCase().includes(search.toLowerCase());
+    const matchType = materialType === "all" || resolvedType === materialType;
     const matchCat = category === "all" || catName === category;
     const matchStatus = status === "all" || b.status === status;
-    return matchSearch && matchCat && matchStatus;
+    return matchSearch && matchType && matchCat && matchStatus;
   });
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
@@ -398,34 +420,35 @@ export default function BooksPage() {
   };
 
   const handleExportCSV = () => {
-    const header = "Title,Author,Accession Number,Category,Shelf Location,Material Type,Status,Library Use Only\n";
+    const header = "Material Type,Title,Author/Creator,Accession Number,Category,Shelf Location,Status,Library Use Only,Notes\n";
     const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
     const body = filtered
       .map((b) =>
         [
+          esc(normalizeMaterialType(b.material_type)),
           esc(b.title),
           esc(b.author),
           esc(b.accession_number),
           esc(b.classifications?.name ?? ""),
           esc(b.shelf_location ?? ""),
-          esc(b.material_type),
           esc(b.status),
           b.is_library_use_only ? "Yes" : "No",
+          esc(b.notes ?? ""),
         ].join(",")
       )
       .join("\n");
     const blob = new Blob(["\uFEFF" + header + body], { type: "text/csv;charset=utf-8;" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = `books_${getServerDateString()}.csv`;
+    link.download = `library_materials_${getServerDateString()}.csv`;
     link.click();
     URL.revokeObjectURL(link.href);
   };
 
   const handlePrintList = () => {
     requestPrint({
-      title: "Books Inventory",
-      filename: `bcas_books_inventory_${getServerDateString()}.html`,
+      title: "Library Materials Inventory",
+      filename: `bcas_library_materials_${getServerDateString()}.html`,
     });
   };
 
@@ -435,8 +458,11 @@ export default function BooksPage() {
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4 animate-fade-in-up stagger-1 no-print">
         <div>
           <h2 className="text-xl sm:text-2xl font-bold text-slate-900">
-            Books
+            Library Materials
           </h2>
+          <p className="text-sm text-slate-500 mt-1">
+            Manage books, magazines, journals, newspapers, theses, and other materials.
+          </p>
         </div>
         <div className="flex items-center gap-3">
           <button onClick={handleExportCSV} className="flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 bg-white hover:bg-slate-50 transition-colors no-print">
@@ -449,24 +475,64 @@ export default function BooksPage() {
           </button>
           <button onClick={openAddModal} className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-700 text-white text-sm font-medium hover:bg-emerald-800 transition-colors">
             <Plus className="w-4 h-4" />
-            <span className="hidden sm:inline">Add New Book</span>
-            <span className="sm:hidden">Add Book</span>
+            <span className="hidden sm:inline">Add Material</span>
+            <span className="sm:hidden">Add</span>
           </button>
         </div>
+      </div>
+
+      {/* Material Type Quick Tabs */}
+      <div className="flex items-center gap-2 overflow-x-auto pb-2 mb-4 no-print">
+        <button
+          type="button"
+          onClick={() => {
+            setMaterialType("all");
+            setPage(1);
+          }}
+          className={`px-3 py-1.5 rounded-lg text-xs font-semibold border whitespace-nowrap transition-colors ${
+            materialType === "all"
+              ? "bg-emerald-700 text-white border-emerald-700"
+              : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+          }`}
+        >
+          All Materials ({books.length})
+        </button>
+        {LIBRARY_MATERIAL_TYPES.map((type) => {
+          const meta = getMaterialMeta(type);
+          const count = materialCounts[type] ?? 0;
+          const active = materialType === type;
+          return (
+            <button
+              key={type}
+              type="button"
+              onClick={() => {
+                setMaterialType(type);
+                setPage(1);
+              }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold border whitespace-nowrap transition-colors ${
+                active
+                  ? "bg-emerald-700 text-white border-emerald-700"
+                  : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+              }`}
+            >
+              {meta.plural} ({count})
+            </button>
+          );
+        })}
       </div>
 
       {/* Search & Filters */}
       <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-5 animate-fade-in-up stagger-2" data-print-area>
         <div className="hidden print:block mb-4 print-header">
-          <h2 className="text-xl font-bold text-slate-900">BCAS Library — Books Inventory</h2>
+          <h2 className="text-xl font-bold text-slate-900">BCAS Library — Library Materials Inventory</h2>
           <p className="text-sm text-slate-500">
             Generated {getServerNow().toLocaleString()} • {filtered.length} record(s)
-            {search || category !== "all" || status !== "all" ? " (filtered)" : ""}
+            {search || materialType !== "all" || category !== "all" || status !== "all" ? " (filtered)" : ""}
           </p>
         </div>
         {staffRestricted && (
           <div className="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-200 text-sm text-amber-800 no-print">
-            {STAFF_RESTRICTED_MESSAGE} Deleted books can be reviewed under Archive by a Librarian or Admin.
+            {STAFF_RESTRICTED_MESSAGE} Deleted materials can be reviewed under Archive by a Librarian or Admin.
           </div>
         )}
         <div className="flex flex-col sm:flex-row gap-3 mb-6 no-print">
@@ -474,7 +540,7 @@ export default function BooksPage() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
             <input
               type="text"
-              placeholder="Search by title, author, or category..."
+              placeholder="Search by title, author/publisher, material type, accession #, or category..."
               value={search}
               onChange={(e) => {
                 setSearch(e.target.value);
@@ -599,6 +665,20 @@ export default function BooksPage() {
                         </div>
                       </td>
                       <td className="px-4 py-4">
+                        <div className="flex flex-wrap items-center gap-1.5 mb-0.5">
+                          <span
+                            className={`inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                              getMaterialMeta(book.material_type).badgeClass
+                            }`}
+                          >
+                            {getMaterialMeta(book.material_type).label}
+                          </span>
+                          {book.is_library_use_only && (
+                            <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-600 border border-slate-200">
+                              Library Use Only
+                            </span>
+                          )}
+                        </div>
                         <p className="font-medium text-slate-900">{book.title}</p>
                         <p className="text-xs text-slate-500 mt-0.5">{book.author}</p>
                         <p className="text-xs text-slate-400 mt-0.5 md:hidden">
@@ -646,7 +726,8 @@ export default function BooksPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-slate-200">
-                <th className="text-left px-2 py-2 font-semibold text-slate-500">Title &amp; Author</th>
+                <th className="text-left px-2 py-2 font-semibold text-slate-500">Type</th>
+                <th className="text-left px-2 py-2 font-semibold text-slate-500">Title &amp; Creator</th>
                 <th className="text-left px-2 py-2 font-semibold text-slate-500">Accession #</th>
                 <th className="text-left px-2 py-2 font-semibold text-slate-500">Category</th>
                 <th className="text-left px-2 py-2 font-semibold text-slate-500">Shelf</th>
@@ -656,6 +737,7 @@ export default function BooksPage() {
             <tbody>
               {filtered.map((book) => (
                 <tr key={book.id} className="border-b border-slate-100">
+                  <td className="px-2 py-2 text-xs font-medium text-slate-700">{normalizeMaterialType(book.material_type)}</td>
                   <td className="px-2 py-2">
                     <div className="font-medium text-slate-800">{book.title}</div>
                     <div className="text-xs text-slate-500">{book.author}</div>
@@ -669,7 +751,7 @@ export default function BooksPage() {
             </tbody>
           </table>
           {filtered.length === 0 && (
-            <p className="py-8 text-center text-slate-400 text-sm">No books found.</p>
+            <p className="py-8 text-center text-slate-400 text-sm">No library materials found.</p>
           )}
         </div>
 
@@ -752,11 +834,11 @@ export default function BooksPage() {
         </>
       )}
 
-      {/* Add Book Modal */}
+      {/* Add Material Modal */}
       <BookFormModal
         open={showAddModal}
-        title="Add New Book"
-        subtitle="Enter the book details below."
+        title="Add Library Material"
+        subtitle="Add a book, magazine, journal, newspaper, thesis, or other material."
         form={form}
         setForm={setForm}
         formError={formError}
@@ -767,10 +849,10 @@ export default function BooksPage() {
         onClose={() => setShowAddModal(false)}
       />
 
-      {/* Edit Book Modal */}
+      {/* Edit Material Modal */}
       <BookFormModal
         open={showEditModal}
-        title="Edit Book"
+        title="Edit Library Material"
         subtitle={editingBook ? `Updating "${editingBook.title}"` : undefined}
         form={form}
         setForm={setForm}
@@ -787,8 +869,8 @@ export default function BooksPage() {
         open={!!deletingBook}
         onClose={() => { setDeletingBook(null); setDeleteError(null); }}
         onConfirm={handleDelete}
-        title="Delete Book"
-        message={deleteError ?? (deletingBook ? `Delete "${deletingBook.title}" by ${deletingBook.author}? This cannot be undone.` : "")}
+        title="Delete Material"
+        message={deleteError ?? (deletingBook ? `Delete "${deletingBook.title}" (${normalizeMaterialType(deletingBook.material_type)}) by ${deletingBook.author}? This will move it to the Archive.` : "")}
         confirmLabel="Delete"
         confirming={deleting}
       />

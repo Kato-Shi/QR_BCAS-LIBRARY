@@ -22,6 +22,8 @@ import {
   formatOrdinal,
   getStudentViolationStatus,
 } from "@/lib/supabase/violations";
+import Link from "next/link";
+import { getMaterialMeta } from "@/lib/materials";
 import { formatDateTime } from "@/lib/reports-excel";
 import { getServerDateString, syncServerClock } from "@/lib/server-clock";
 import type { BookWithClassification, Student, StudentViolationStatus } from "@/lib/types";
@@ -253,13 +255,29 @@ export default function ScanPage() {
   return (
     <>
       {/* Header */}
-      <div className="mb-6 animate-fade-in-up stagger-1">
-        <h2 className="text-xl sm:text-2xl font-bold text-slate-900">
-          Borrow / Return
-        </h2>
-        <p className="text-sm text-slate-500 mt-1">
-          Scan a book QR code to borrow or return a library item.
-        </p>
+      <div className="mb-6 animate-fade-in-up stagger-1 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div>
+          <h2 className="text-xl sm:text-2xl font-bold text-slate-900">
+            Quick QR Scan
+          </h2>
+          <p className="text-sm text-slate-500 mt-1">
+            Scan any library material QR code (book, magazine, journal, newspaper, thesis) to borrow or return.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Link
+            href="/user/transactions/borrow"
+            className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors"
+          >
+            Borrow Submenu
+          </Link>
+          <Link
+            href="/user/transactions/return"
+            className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors"
+          >
+            Return Submenu
+          </Link>
+        </div>
       </div>
 
       <div className="max-w-2xl mx-auto">
@@ -414,9 +432,18 @@ export default function ScanPage() {
           {bookInfo && (
             <div className="space-y-6">
               <div>
-                <h4 className="text-sm font-semibold text-slate-700 mb-3">
-                  Book Information
-                </h4>
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <h4 className="text-sm font-semibold text-slate-700">
+                    Material Information
+                  </h4>
+                  <span
+                    className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold ${
+                      getMaterialMeta(bookInfo.material_type).badgeClass
+                    }`}
+                  >
+                    {getMaterialMeta(bookInfo.material_type).label}
+                  </span>
+                </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-xs font-medium text-slate-500 mb-1">

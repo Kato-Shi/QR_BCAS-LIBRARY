@@ -3,7 +3,14 @@
 // ============================================================
 
 export type BookStatus = "Available" | "Borrowed" | "Lost" | "Damaged";
-export type MaterialType = "Book" | "Non-Book";
+export type MaterialType =
+  | "Book"
+  | "Magazine"
+  | "Journal"
+  | "Newspaper"
+  | "Thesis"
+  | "Other Material"
+  | "Non-Book";
 export type BorrowStatus = "Active" | "Returned" | "Overdue";
 export type StaffRole = "Admin" | "Librarian" | "Staff";
 
